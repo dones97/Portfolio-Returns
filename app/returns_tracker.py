@@ -30,15 +30,21 @@ def read_trade_report(file):
         df = pd.read_csv(file)
     else:
         df = pd.read_excel(file)
-    # Standardize columns
-    df = df.rename(columns=lambda x: x.strip().lower())
-    for col in df.columns:
-        if "scrip" in col and "code" in col:
-            df.rename(columns={col: "scrip_code"}, inplace=True)
-        if "company" in col and "name" in col:
-            df.rename(columns={col: "company_name"}, inplace=True)
-        if "isin" in col:
-            df.rename(columns={col: "isin"}, inplace=True)
+    # Normalize and rename columns for downstream processing
+    cols = {c: c.strip().lower().replace(" ", "_") for c in df.columns}
+    df.rename(columns=cols, inplace=True)
+    # Map your actual columns to expected standardized names
+    rename_map = {
+        'scrip_code': 'scrip_code',
+        'scrip code': 'scrip_code',
+        'side': 'buy/sell',
+        'quantity': 'quantity',
+        'price': 'price',
+        'company': 'company_name'
+    }
+    for k, v in rename_map.items():
+        if k in df.columns and v not in df.columns:
+            df.rename(columns={k: v}, inplace=True)
     return df
 
 def try_yahoo_bse_ticker(scrip_code):
