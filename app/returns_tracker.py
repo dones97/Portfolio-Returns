@@ -42,7 +42,15 @@ def read_trade_report(file):
     return df
 
 def try_yahoo_bse_ticker(scrip_code):
-    ticker = f"{int(scrip_code):06d}.BO"
+    """
+    Given a scrip code, returns its Yahoo Finance ticker if it exists (with .BO suffix).
+    Handles numeric and alphanumeric scrip codes.
+    """
+    s = str(scrip_code).strip()
+    if s.isdigit():
+        ticker = f"{s.zfill(6)}.BO"
+    else:
+        ticker = f"{s}.BO"
     try:
         data = yf.Ticker(ticker).history(period="1d")
         if not data.empty:
