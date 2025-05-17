@@ -1,6 +1,6 @@
 streamlit>=1.25
 pandas
 numpy
-yfinance 0.2.54
+yfinance>=0.2.18
 scipy
 openpyxl
