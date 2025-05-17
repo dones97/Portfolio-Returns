@@ -1,6 +1,11 @@
-streamlit>=1.25
-pandas
-numpy
+streamlit>=1.24.0
+pandas>=1.5.0
+numpy>=1.23.0
 yfinance>=0.2.18
-scipy
-openpyxl
+statsmodels>=0.13.5
+plotly>=5.13.0
+pandas-datareader>=0.10.0
+setuptools>=65.5.1
+openpyxl>=3.0.10
+xlrd>=2.0.1
+python-dateutil>=2.8.2
