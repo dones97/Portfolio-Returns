@@ -127,9 +127,12 @@ def get_repository_trade_reports():
     return reports
 
 # --- SESSION STATE KEYS ---
-UNMAPPED_EDITOR_KEY = "unmapped_editor_data"
-DELETE_LIST_KEY = "delete_ticker_list"
 TRADE_SELECTION_KEY = "trade_selection"
+STATIC_UNMAPPED_KEY = "static_unmapped"
+STATIC_MAPPED_KEY = "static_mapped"
+STATIC_TRADES_KEY = "static_trades"
+STATIC_MAPPING_KEY = "static_mapping"
+DELETE_LIST_KEY = "delete_ticker_list"
 
 # --- MAIN APP UI ---
 
@@ -177,17 +180,42 @@ with tabs[0]:
         if fname in selected_repo_files:
             all_trades.append(df)
 
+    # --- Build trades DataFrame and mapping only on initial load or after update ---
     if all_trades:
         trades = pd.concat(all_trades, ignore_index=True)
-        st.success(f"Loaded {len(trades)} trades from {len(all_trades)} report(s).")
-        st.write("First 5 rows of combined trades:", trades.head())
-
         trades['scrip_code'] = trades['scrip_code'].astype(str).str.strip()
 
-        # --- Always recalculate mapping/unmapped when trades change ---
-        trades['yahoo_ticker'] = trades.apply(lambda row: map_ticker_for_row(row, user_mappings), axis=1)
-        unmapped = trades[trades['yahoo_ticker'] == ""][['scrip_code', 'company_name']].drop_duplicates()
-        unmapped['yahoo_ticker'] = ""
+        # On initial load or when trade report selection changes, reload session state tables
+        if (
+            STATIC_TRADES_KEY not in st.session_state
+            or st.session_state[STATIC_TRADES_KEY] is None
+            or st.session_state.get("last_selection") != selected_repo_files
+            or st.session_state.get("last_uploaded_files") != [f.name for f in uploaded_files] if uploaded_files else []
+        ):
+            trades['yahoo_ticker'] = trades.apply(lambda row: map_ticker_for_row(row, user_mappings), axis=1)
+            unmapped = trades[trades['yahoo_ticker'] == ""][['scrip_code', 'company_name']].drop_duplicates()
+            unmapped['yahoo_ticker'] = ""
+            mapped = trades[trades['yahoo_ticker'] != ""].copy()
+            if not mapped.empty:
+                mapped['yahoo_stock_name'] = mapped['yahoo_ticker'].apply(get_yahoo_stock_name)
+            mapping_df = pd.DataFrame([
+                {"scrip_code": k, "yahoo_ticker": v} for k, v in user_mappings.items()
+            ])
+            # Save to session state
+            st.session_state[STATIC_TRADES_KEY] = trades
+            st.session_state[STATIC_UNMAPPED_KEY] = unmapped.reset_index(drop=True)
+            st.session_state[STATIC_MAPPED_KEY] = mapped.reset_index(drop=True)
+            st.session_state[STATIC_MAPPING_KEY] = mapping_df
+            st.session_state["last_selection"] = selected_repo_files
+            st.session_state["last_uploaded_files"] = [f.name for f in uploaded_files] if uploaded_files else []
+
+        trades = st.session_state[STATIC_TRADES_KEY]
+        unmapped = st.session_state[STATIC_UNMAPPED_KEY]
+        mapped = st.session_state[STATIC_MAPPED_KEY]
+        mapping_df = st.session_state[STATIC_MAPPING_KEY]
+
+        st.success(f"Loaded {len(trades)} trades from {len(all_trades)} report(s).")
+        st.write("First 5 rows of combined trades:", trades.head())
 
         st.subheader("Unmapped Scrip Codes")
         st.write("Enter Yahoo tickers for unmapped codes, or select tickers to delete all trades for them (e.g., delisted stocks).")
@@ -207,7 +235,7 @@ with tabs[0]:
 
         if st.button("Update Mapping and Delete Selected Tickers"):
             # Remove all trades for selected tickers
-            trades = trades[~trades['scrip_code'].isin(delete_selection)]
+            trades_new = trades[~trades['scrip_code'].isin(delete_selection)].copy()
             # Update mapping for new tickers
             new_mappings = {}
             failed_codes = []
@@ -237,28 +265,28 @@ with tabs[0]:
                 for code, ticker in failed_codes:
                     st.warning(f"Ticker {ticker} for code {code} is not valid on Yahoo Finance and was not saved.")
 
-            # Recalculate mapping/unmapped after update
-            trades['yahoo_ticker'] = trades.apply(lambda row: map_ticker_for_row(row, user_mappings), axis=1)
-            unmapped = trades[trades['yahoo_ticker'] == ""][['scrip_code', 'company_name']].drop_duplicates()
-            unmapped['yahoo_ticker'] = ""
+            # Recalculate mapping/unmapped/mapped/mapping table after update
+            trades_new['yahoo_ticker'] = trades_new.apply(lambda row: map_ticker_for_row(row, user_mappings), axis=1)
+            unmapped_new = trades_new[trades_new['yahoo_ticker'] == ""][['scrip_code', 'company_name']].drop_duplicates()
+            unmapped_new['yahoo_ticker'] = ""
+            mapped_new = trades_new[trades_new['yahoo_ticker'] != ""].copy()
+            if not mapped_new.empty:
+                mapped_new['yahoo_stock_name'] = mapped_new['yahoo_ticker'].apply(get_yahoo_stock_name)
+            mapping_df_new = pd.DataFrame([
+                {"scrip_code": k, "yahoo_ticker": v} for k, v in user_mappings.items()
+            ])
+            # Save to session state
+            st.session_state[STATIC_TRADES_KEY] = trades_new
+            st.session_state[STATIC_UNMAPPED_KEY] = unmapped_new.reset_index(drop=True)
+            st.session_state[STATIC_MAPPED_KEY] = mapped_new.reset_index(drop=True)
+            st.session_state[STATIC_MAPPING_KEY] = mapping_df_new
             st.success("Mapping and deletion complete. Tables updated.")
-
-        # --- Ensure 'yahoo_ticker' exists before using ---
-        if 'yahoo_ticker' not in trades.columns:
-            trades['yahoo_ticker'] = ""
-
-        mapped = trades[trades['yahoo_ticker'] != ""].copy()
-        if not mapped.empty:
-            mapped['yahoo_stock_name'] = mapped['yahoo_ticker'].apply(get_yahoo_stock_name)
 
         st.subheader("Mapped Trades")
         st.write(mapped)
 
         st.markdown("---")
         st.subheader("Current User Ticker Mappings")
-        mapping_df = pd.DataFrame([
-            {"scrip_code": k, "yahoo_ticker": v} for k, v in user_mappings.items()
-        ])
         st.dataframe(mapping_df)
         st.info(f"Mappings are stored in `{MAPPINGS_CSV}` and pushed to GitHub for permanent persistence.")
 
