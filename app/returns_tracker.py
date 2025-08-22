@@ -129,153 +129,145 @@ def get_repository_trade_reports():
 # --- SESSION STATE KEYS ---
 UNMAPPED_EDITOR_KEY = "unmapped_editor_data"
 DELETE_LIST_KEY = "delete_ticker_list"
+TRADE_SELECTION_KEY = "trade_selection"
 
 # --- MAIN APP UI ---
 
 st.title("Portfolio Ticker Mapping & Storage Demo (Excel + Historical Reports)")
 
-st.markdown("""
-This app maps your scrip codes to Yahoo Finance tickers.<br>
-- **Upload one or more Excel trade reports below.**
-- **Or select from trade reports available in the repository.**
-- **Numeric codes** are mapped to `.BO` tickers (e.g., `543306` → `543306.BO`).
-- **If mapping fails**, you can edit unmapped tickers below and update your custom mapping in one go.
-- **You can also delete trades for unmappable/delisted tickers.**
-- **Your mappings are saved in `ticker_mappings.csv`** for reuse and manual editing.
-""", unsafe_allow_html=True)
+tabs = st.tabs(["Trade Mapping", "Returns Calculation (Coming Soon)"])
 
-user_mappings = load_user_mappings()
+with tabs[0]:
+    st.markdown("""
+    This app maps your scrip codes to Yahoo Finance tickers.<br>
+    - **Upload one or more Excel trade reports below.**
+    - **Or select from trade reports available in the repository.**
+    - **Numeric codes** are mapped to `.BO` tickers (e.g., `543306` → `543306.BO`).
+    - **If mapping fails**, you can edit unmapped tickers below and update your custom mapping in one go.
+    - **You can also delete trades for unmappable/delisted tickers.**
+    - **Your mappings are saved in `ticker_mappings.csv`** for reuse and manual editing.
+    """, unsafe_allow_html=True)
 
-uploaded_files = st.file_uploader("Upload your trade reports (Excel)", type=["xlsx"], accept_multiple_files=True)
+    user_mappings = load_user_mappings()
 
-st.subheader("Trade Reports from Previous Years (in repository)")
-repo_reports = get_repository_trade_reports()
-selected_repo_files = []
-if repo_reports:
-    repo_file_names = [fname for fname, _ in repo_reports]
+    uploaded_files = st.file_uploader("Upload your trade reports (Excel)", type=["xlsx"], accept_multiple_files=True)
+
+    st.subheader("Trade Reports from Previous Years (in repository)")
+    repo_reports = get_repository_trade_reports()
+    repo_file_names = [fname for fname, _ in repo_reports] if repo_reports else []
     selected_repo_files = st.multiselect(
         "Select previous trade reports to include:",
         repo_file_names,
-        default=[]
+        default=[],
+        key=TRADE_SELECTION_KEY
     )
 
-all_trades = []
+    # --- Always recalculate all_trades when selection changes ---
+    all_trades = []
 
-if uploaded_files:
-    for file in uploaded_files:
-        try:
-            df = read_trade_report(file)
+    if uploaded_files:
+        for file in uploaded_files:
+            try:
+                df = read_trade_report(file)
+                all_trades.append(df)
+            except Exception as e:
+                st.error(f"Could not read uploaded file {file.name}: {e}")
+
+    for fname, df in repo_reports:
+        if fname in selected_repo_files:
             all_trades.append(df)
-        except Exception as e:
-            st.error(f"Could not read uploaded file {file.name}: {e}")
 
-for fname, df in repo_reports:
-    if fname in selected_repo_files:
-        all_trades.append(df)
+    if all_trades:
+        trades = pd.concat(all_trades, ignore_index=True)
+        st.success(f"Loaded {len(trades)} trades from {len(all_trades)} report(s).")
+        st.write("First 5 rows of combined trades:", trades.head())
 
-if all_trades:
-    trades = pd.concat(all_trades, ignore_index=True)
-    st.success(f"Loaded {len(trades)} trades from {len(all_trades)} report(s).")
-    st.write("First 5 rows of combined trades:", trades.head())
+        trades['scrip_code'] = trades['scrip_code'].astype(str).str.strip()
 
-    trades['scrip_code'] = trades['scrip_code'].astype(str).str.strip()
-
-    # --- MAPPING LOGIC ---
-    # Only update mappings/table when user hits button
-    # Prepare unmapped and mapped tables via session state
-    if UNMAPPED_EDITOR_KEY not in st.session_state:
-        # Initial mapping
+        # --- Always recalculate mapping/unmapped when trades change ---
         trades['yahoo_ticker'] = trades.apply(lambda row: map_ticker_for_row(row, user_mappings), axis=1)
         unmapped = trades[trades['yahoo_ticker'] == ""][['scrip_code', 'company_name']].drop_duplicates()
         unmapped['yahoo_ticker'] = ""
-        st.session_state[UNMAPPED_EDITOR_KEY] = unmapped.reset_index(drop=True)
-        st.session_state[DELETE_LIST_KEY] = []
-    else:
-        # Use the session state unmapped editor data
-        unmapped = st.session_state[UNMAPPED_EDITOR_KEY]
 
-    # Show unmapped table (no recalculation when editing)
-    st.subheader("Unmapped Scrip Codes")
-    st.write("Enter Yahoo tickers for unmapped codes, or select tickers to delete all trades for them (e.g., delisted stocks).")
-    edited = st.data_editor(
-        unmapped,
-        key="unmapped_editor",
-        num_rows="dynamic"
-    )
+        st.subheader("Unmapped Scrip Codes")
+        st.write("Enter Yahoo tickers for unmapped codes, or select tickers to delete all trades for them (e.g., delisted stocks).")
+        edited = st.data_editor(
+            unmapped,
+            key="unmapped_editor",
+            num_rows="dynamic"
+        )
 
-    # Option to select tickers to delete
-    delete_candidates = edited['scrip_code'].tolist()
-    delete_selection = st.multiselect(
-        "Select tickers to delete all trades for (delisted, not needed):",
-        delete_candidates,
-        default=st.session_state.get(DELETE_LIST_KEY, [])
-    )
-    st.session_state[DELETE_LIST_KEY] = delete_selection
+        delete_candidates = edited['scrip_code'].tolist()
+        delete_selection = st.multiselect(
+            "Select tickers to delete all trades for (delisted, not needed):",
+            delete_candidates,
+            default=[],
+            key="delete_selection"
+        )
 
-    # Update mapping button
-    if st.button("Update Mapping and Delete Selected Tickers"):
-        # Update unmapped editor session state from edited table
-        st.session_state[UNMAPPED_EDITOR_KEY] = edited.copy().reset_index(drop=True)
-        # Remove all trades for selected tickers
-        trades = trades[~trades['scrip_code'].isin(delete_selection)]
-        # Update mapping for new tickers
-        new_mappings = {}
-        failed_codes = []
-        for _, row in edited.iterrows():
-            code = str(row['scrip_code']).strip()
-            ticker = str(row['yahoo_ticker']).strip().upper()
-            if ticker and code not in delete_selection:
-                if yahoo_ticker_valid(ticker):
-                    new_mappings[code] = ticker
+        if st.button("Update Mapping and Delete Selected Tickers"):
+            # Remove all trades for selected tickers
+            trades = trades[~trades['scrip_code'].isin(delete_selection)]
+            # Update mapping for new tickers
+            new_mappings = {}
+            failed_codes = []
+            for _, row in edited.iterrows():
+                code = str(row['scrip_code']).strip()
+                ticker = str(row['yahoo_ticker']).strip().upper()
+                if ticker and code not in delete_selection:
+                    if yahoo_ticker_valid(ticker):
+                        new_mappings[code] = ticker
+                    else:
+                        failed_codes.append((code, ticker))
+            if new_mappings:
+                user_mappings.update(new_mappings)
+                save_user_mappings(user_mappings)
+                # --- Push to GitHub ---
+                token = st.secrets["GITHUB_TOKEN"] if "GITHUB_TOKEN" in st.secrets else None
+                if token:
+                    push_mapping_to_github(
+                        filepath=MAPPINGS_CSV,
+                        repo=GITHUB_REPO,
+                        branch=GITHUB_BRANCH,
+                        token=token
+                    )
                 else:
-                    failed_codes.append((code, ticker))
-        if new_mappings:
-            user_mappings.update(new_mappings)
-            save_user_mappings(user_mappings)
-            # --- Push to GitHub ---
-            token = st.secrets["GITHUB_TOKEN"] if "GITHUB_TOKEN" in st.secrets else None
-            if token:
-                push_mapping_to_github(
-                    filepath=MAPPINGS_CSV,
-                    repo=GITHUB_REPO,
-                    branch=GITHUB_BRANCH,
-                    token=token
-                )
-            else:
-                st.warning("No GitHub token found in Streamlit secrets. File only saved locally (may be lost after restart).")
-        if failed_codes:
-            for code, ticker in failed_codes:
-                st.warning(f"Ticker {ticker} for code {code} is not valid on Yahoo Finance and was not saved.")
+                    st.warning("No GitHub token found in Streamlit secrets. File only saved locally (may be lost after restart).")
+            if failed_codes:
+                for code, ticker in failed_codes:
+                    st.warning(f"Ticker {ticker} for code {code} is not valid on Yahoo Finance and was not saved.")
 
-        # Update mapped/unmapped
-        trades['yahoo_ticker'] = trades.apply(lambda row: map_ticker_for_row(row, user_mappings), axis=1)
-        unmapped = trades[trades['yahoo_ticker'] == ""][['scrip_code', 'company_name']].drop_duplicates()
-        unmapped['yahoo_ticker'] = ""
-        st.session_state[UNMAPPED_EDITOR_KEY] = unmapped.reset_index(drop=True)
-        st.session_state[DELETE_LIST_KEY] = []
-        st.success("Mapping and deletion complete. Tables updated.")
+            # Recalculate mapping/unmapped after update
+            trades['yahoo_ticker'] = trades.apply(lambda row: map_ticker_for_row(row, user_mappings), axis=1)
+            unmapped = trades[trades['yahoo_ticker'] == ""][['scrip_code', 'company_name']].drop_duplicates()
+            unmapped['yahoo_ticker'] = ""
+            st.success("Mapping and deletion complete. Tables updated.")
 
-    # --- FIX: Ensure 'yahoo_ticker' exists before using ---
-    if 'yahoo_ticker' not in trades.columns:
-        trades['yahoo_ticker'] = ""
+        # --- Ensure 'yahoo_ticker' exists before using ---
+        if 'yahoo_ticker' not in trades.columns:
+            trades['yahoo_ticker'] = ""
 
-    mapped = trades[trades['yahoo_ticker'] != ""].copy()
-    if not mapped.empty:
-        mapped['yahoo_stock_name'] = mapped['yahoo_ticker'].apply(get_yahoo_stock_name)
+        mapped = trades[trades['yahoo_ticker'] != ""].copy()
+        if not mapped.empty:
+            mapped['yahoo_stock_name'] = mapped['yahoo_ticker'].apply(get_yahoo_stock_name)
 
-    st.subheader("Mapped Trades")
-    st.write(mapped)
+        st.subheader("Mapped Trades")
+        st.write(mapped)
+
+        st.markdown("---")
+        st.subheader("Current User Ticker Mappings")
+        mapping_df = pd.DataFrame([
+            {"scrip_code": k, "yahoo_ticker": v} for k, v in user_mappings.items()
+        ])
+        st.dataframe(mapping_df)
+        st.info(f"Mappings are stored in `{MAPPINGS_CSV}` and pushed to GitHub for permanent persistence.")
+
+    else:
+        st.info("Upload at least one Excel file or select trade reports from the repository to begin.")
 
     st.markdown("---")
-    st.subheader("Current User Ticker Mappings")
-    mapping_df = pd.DataFrame([
-        {"scrip_code": k, "yahoo_ticker": v} for k, v in user_mappings.items()
-    ])
-    st.dataframe(mapping_df)
-    st.info(f"Mappings are stored in `{MAPPINGS_CSV}` and pushed to GitHub for permanent persistence.")
+    st.info(f"To add new trade reports for previous years, place `.xlsx` files in the `{TRADE_REPORTS_DIR}` folder in this repository. The app will pick them up automatically.")
 
-else:
-    st.info("Upload at least one Excel file or select trade reports from the repository to begin.")
-
-st.markdown("---")
-st.info(f"To add new trade reports for previous years, place `.xlsx` files in the `{TRADE_REPORTS_DIR}` folder in this repository. The app will pick them up automatically.")
+with tabs[1]:
+    st.header("Returns Calculation (Coming Soon)")
+    st.info("Once all tickers are mapped, you will be able to view and calculate your portfolio returns here.")
