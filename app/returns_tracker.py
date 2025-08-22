@@ -30,6 +30,9 @@ def save_user_mappings(mapping_dict):
     df.to_csv(MAPPINGS_CSV, index=False)
 
 def push_mapping_to_github(filepath, repo, branch, token):
+    if not os.path.exists(filepath):
+        st.error(f"File {filepath} does not exist, cannot push to GitHub.")
+        return False
     with open(filepath, "rb") as f:
         content = f.read()
     b64_content = b64encode(content).decode()
@@ -190,7 +193,7 @@ if all_trades:
     else:
         # Use the session state unmapped editor data
         unmapped = st.session_state[UNMAPPED_EDITOR_KEY]
-    
+
     # Show unmapped table (no recalculation when editing)
     st.subheader("Unmapped Scrip Codes")
     st.write("Enter Yahoo tickers for unmapped codes, or select tickers to delete all trades for them (e.g., delisted stocks).")
@@ -252,8 +255,13 @@ if all_trades:
         st.session_state[DELETE_LIST_KEY] = []
         st.success("Mapping and deletion complete. Tables updated.")
 
+    # --- FIX: Ensure 'yahoo_ticker' exists before using ---
+    if 'yahoo_ticker' not in trades.columns:
+        trades['yahoo_ticker'] = ""
+
     mapped = trades[trades['yahoo_ticker'] != ""].copy()
-    mapped['yahoo_stock_name'] = mapped['yahoo_ticker'].apply(get_yahoo_stock_name)
+    if not mapped.empty:
+        mapped['yahoo_stock_name'] = mapped['yahoo_ticker'].apply(get_yahoo_stock_name)
 
     st.subheader("Mapped Trades")
     st.write(mapped)
