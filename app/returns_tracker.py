@@ -11,6 +11,7 @@ MAPPINGS_CSV = "ticker_mappings.csv"
 TRADE_REPORTS_DIR = "trade_reports"
 GITHUB_REPO = "dones97/Portfolio-Returns"
 GITHUB_BRANCH = "main"
+PORTFOLIO_HISTORY_CSV = "portfolio_history.csv"
 
 # --- HELPER FUNCTIONS ---
 
@@ -29,7 +30,7 @@ def save_user_mappings(mapping_dict):
     )
     df.to_csv(MAPPINGS_CSV, index=False)
 
-def push_mapping_to_github(filepath, repo, branch, token):
+def push_file_to_github(filepath, repo, branch, token, message="Update file via Streamlit app"):
     if not os.path.exists(filepath):
         st.error(f"File {filepath} does not exist, cannot push to GitHub.")
         return False
@@ -43,7 +44,7 @@ def push_mapping_to_github(filepath, repo, branch, token):
     if r.status_code == 200:
         sha = r.json().get("sha", None)
     data = {
-        "message": "Update ticker_mappings.csv via Streamlit app",
+        "message": message,
         "content": b64_content,
         "branch": branch,
     }
@@ -51,7 +52,7 @@ def push_mapping_to_github(filepath, repo, branch, token):
         data["sha"] = sha
     r = requests.put(url, headers=headers, json=data)
     if r.status_code in [200, 201]:
-        st.success("Mapping file updated and pushed to GitHub!")
+        st.success(f"{os.path.basename(filepath)} updated and pushed to GitHub!")
         return True
     else:
         st.error(f"Error pushing file to GitHub: {r.text}")
@@ -135,12 +136,13 @@ STATIC_MAPPING_KEY = "static_mapping"
 DELETE_LIST_KEY = "delete_ticker_list"
 LAST_SELECTION_KEY = "last_selection"
 LAST_UPLOADED_KEY = "last_uploaded_files"
+PORTFOLIO_HISTORY_KEY = "portfolio_history"
 
 # --- MAIN APP UI ---
 
-st.title("Portfolio Ticker Mapping & Storage Demo (Excel + Historical Reports)")
+st.title("Portfolio Returns Tracker")
 
-tabs = st.tabs(["Trade Mapping", "Returns Calculation (Coming Soon)"])
+tabs = st.tabs(["Trade Mapping", "Portfolio Returns"])
 
 with tabs[0]:
     st.markdown("""
@@ -169,7 +171,6 @@ with tabs[0]:
 
     # --- Always recalculate all_trades when selection changes ---
     all_trades = []
-
     uploaded_names = [f.name for f in uploaded_files] if uploaded_files else []
 
     if uploaded_files:
@@ -193,7 +194,6 @@ with tabs[0]:
         trades = pd.concat(all_trades, ignore_index=True)
         trades['scrip_code'] = trades['scrip_code'].astype(str).str.strip()
 
-        # On initial load or when trade report selection changes, reload session state tables
         if (
             not state_exists([STATIC_TRADES_KEY, STATIC_UNMAPPED_KEY, STATIC_MAPPED_KEY, STATIC_MAPPING_KEY, LAST_SELECTION_KEY, LAST_UPLOADED_KEY])
             or st.session_state[LAST_SELECTION_KEY] != selected_repo_files
@@ -241,9 +241,7 @@ with tabs[0]:
         )
 
         if st.button("Update Mapping and Delete Selected Tickers"):
-            # Remove all trades for selected tickers
             trades_new = trades[~trades['scrip_code'].isin(delete_selection)].copy()
-            # Update mapping for new tickers
             new_mappings = {}
             failed_codes = []
             for _, row in edited.iterrows():
@@ -257,14 +255,14 @@ with tabs[0]:
             if new_mappings:
                 user_mappings.update(new_mappings)
                 save_user_mappings(user_mappings)
-                # --- Push to GitHub ---
                 token = st.secrets["GITHUB_TOKEN"] if "GITHUB_TOKEN" in st.secrets else None
                 if token:
-                    push_mapping_to_github(
+                    push_file_to_github(
                         filepath=MAPPINGS_CSV,
                         repo=GITHUB_REPO,
                         branch=GITHUB_BRANCH,
-                        token=token
+                        token=token,
+                        message="Update ticker_mappings.csv via Streamlit app"
                     )
                 else:
                     st.warning("No GitHub token found in Streamlit secrets. File only saved locally (may be lost after restart).")
@@ -282,7 +280,6 @@ with tabs[0]:
             mapping_df_new = pd.DataFrame([
                 {"scrip_code": k, "yahoo_ticker": v} for k, v in user_mappings.items()
             ])
-            # Save to session state
             st.session_state[STATIC_TRADES_KEY] = trades_new
             st.session_state[STATIC_UNMAPPED_KEY] = unmapped_new.reset_index(drop=True)
             st.session_state[STATIC_MAPPED_KEY] = mapped_new.reset_index(drop=True)
@@ -297,6 +294,28 @@ with tabs[0]:
         st.dataframe(mapping_df)
         st.info(f"Mappings are stored in `{MAPPINGS_CSV}` and pushed to GitHub for permanent persistence.")
 
+        # --- Portfolio History Save Button ---
+        st.markdown("---")
+        st.subheader("Portfolio History")
+        st.write("Once all trades are mapped, save your portfolio history to the repository. This will be used for returns calculation.")
+        if st.button("Save Portfolio History"):
+            # Save mapped trades to CSV
+            mapped_to_save = mapped.copy()
+            mapped_to_save.to_csv(PORTFOLIO_HISTORY_CSV, index=False)
+            st.session_state[PORTFOLIO_HISTORY_KEY] = mapped_to_save
+            token = st.secrets["GITHUB_TOKEN"] if "GITHUB_TOKEN" in st.secrets else None
+            if token:
+                push_file_to_github(
+                    filepath=PORTFOLIO_HISTORY_CSV,
+                    repo=GITHUB_REPO,
+                    branch=GITHUB_BRANCH,
+                    token=token,
+                    message="Update portfolio_history.csv via Streamlit app"
+                )
+            else:
+                st.warning("No GitHub token found in Streamlit secrets. History only saved locally (may be lost after restart).")
+            st.success("Portfolio history saved and pushed to GitHub. Returns tab will now use this data.")
+
     else:
         st.info("Upload at least one Excel file or select trade reports from the repository to begin.")
 
@@ -304,5 +323,15 @@ with tabs[0]:
     st.info(f"To add new trade reports for previous years, place `.xlsx` files in the `{TRADE_REPORTS_DIR}` folder in this repository. The app will pick them up automatically.")
 
 with tabs[1]:
-    st.header("Returns Calculation (Coming Soon)")
-    st.info("Once all tickers are mapped, you will be able to view and calculate your portfolio returns here.")
+    st.header("Portfolio Returns")
+    st.info("Returns are calculated only from the saved portfolio history. Click 'Save Portfolio History' in the previous tab after mapping trades.")
+    # Load portfolio history from session or file
+    portfolio_history = st.session_state.get(PORTFOLIO_HISTORY_KEY, None)
+    if portfolio_history is None and os.path.exists(PORTFOLIO_HISTORY_CSV):
+        portfolio_history = pd.read_csv(PORTFOLIO_HISTORY_CSV)
+        st.session_state[PORTFOLIO_HISTORY_KEY] = portfolio_history
+    if portfolio_history is not None:
+        st.write("Portfolio history as saved:", portfolio_history)
+        # --- Returns calculation will be implemented here ---
+    else:
+        st.warning("No portfolio history saved yet. Go to Trade Mapping tab and click 'Save Portfolio History' after mapping trades.")
