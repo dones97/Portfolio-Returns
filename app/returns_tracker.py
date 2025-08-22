@@ -3,11 +3,14 @@ import pandas as pd
 import yfinance as yf
 import os
 from glob import glob
+import requests
+from base64 import b64encode
 
 # --- CONFIGURATION ---
-
 MAPPINGS_CSV = "ticker_mappings.csv"
 TRADE_REPORTS_DIR = "trade_reports"
+GITHUB_REPO = "dones97/Portfolio-Returns"
+GITHUB_BRANCH = "main"
 
 # --- HELPER FUNCTIONS ---
 
@@ -25,6 +28,34 @@ def save_user_mappings(mapping_dict):
         columns=["scrip_code", "yahoo_ticker"]
     )
     df.to_csv(MAPPINGS_CSV, index=False)
+
+def push_mapping_to_github(filepath, repo, branch, token):
+    # Get file content
+    with open(filepath, "rb") as f:
+        content = f.read()
+    b64_content = b64encode(content).decode()
+    
+    # Get current sha (if file exists)
+    url = f"https://api.github.com/repos/{repo}/contents/{filepath}"
+    headers = {"Authorization": f"token {token}"}
+    r = requests.get(url, headers=headers)
+    sha = None
+    if r.status_code == 200:
+        sha = r.json().get("sha", None)
+    data = {
+        "message": "Update ticker_mappings.csv via Streamlit app",
+        "content": b64_content,
+        "branch": branch,
+    }
+    if sha:
+        data["sha"] = sha
+    r = requests.put(url, headers=headers, json=data)
+    if r.status_code in [200, 201]:
+        st.success("Mapping file updated and pushed to GitHub!")
+        return True
+    else:
+        st.error(f"Error pushing file to GitHub: {r.text}")
+        return False
 
 def default_bse_mapping(scrip_code):
     if pd.isnull(scrip_code):
@@ -49,7 +80,6 @@ def get_yahoo_stock_name(ticker):
         name = info.get("shortName") or info.get("longName") or info.get("name")
         if name:
             return name
-        # fallback to symbol if nothing else
         return info.get("symbol", "")
     except Exception:
         return ""
@@ -170,7 +200,17 @@ if all_trades:
             if new_mappings:
                 user_mappings.update(new_mappings)
                 save_user_mappings(user_mappings)
-                st.success("Saved new mappings. Please reload or re-upload your files.")
+                # --- Push to GitHub ---
+                token = st.secrets["GITHUB_TOKEN"] if "GITHUB_TOKEN" in st.secrets else None
+                if token:
+                    push_mapping_to_github(
+                        filepath=MAPPINGS_CSV,
+                        repo=GITHUB_REPO,
+                        branch=GITHUB_BRANCH,
+                        token=token
+                    )
+                else:
+                    st.warning("No GitHub token found in Streamlit secrets. File only saved locally (may be lost after restart).")
             if failed_codes:
                 for code, ticker in failed_codes:
                     st.warning(f"Ticker {ticker} for code {code} is not valid on Yahoo Finance and was not saved.")
@@ -178,7 +218,6 @@ if all_trades:
         st.success("All scrip codes mapped successfully!")
 
     mapped = trades[trades['yahoo_ticker'] != ""].copy()
-    # Add Yahoo stock name column
     mapped['yahoo_stock_name'] = mapped['yahoo_ticker'].apply(get_yahoo_stock_name)
 
     st.subheader("Mapped Trades")
@@ -190,7 +229,7 @@ if all_trades:
         {"scrip_code": k, "yahoo_ticker": v} for k, v in user_mappings.items()
     ])
     st.dataframe(mapping_df)
-    st.info(f"Mappings are stored in `{MAPPINGS_CSV}`. You can edit this file by hand for persistent custom mappings.")
+    st.info(f"Mappings are stored in `{MAPPINGS_CSV}` and pushed to GitHub for permanent persistence.")
 
 else:
     st.info("Upload at least one Excel file or select trade reports from the repository to begin.")
