@@ -133,6 +133,8 @@ STATIC_MAPPED_KEY = "static_mapped"
 STATIC_TRADES_KEY = "static_trades"
 STATIC_MAPPING_KEY = "static_mapping"
 DELETE_LIST_KEY = "delete_ticker_list"
+LAST_SELECTION_KEY = "last_selection"
+LAST_UPLOADED_KEY = "last_uploaded_files"
 
 # --- MAIN APP UI ---
 
@@ -168,6 +170,8 @@ with tabs[0]:
     # --- Always recalculate all_trades when selection changes ---
     all_trades = []
 
+    uploaded_names = [f.name for f in uploaded_files] if uploaded_files else []
+
     if uploaded_files:
         for file in uploaded_files:
             try:
@@ -180,6 +184,10 @@ with tabs[0]:
         if fname in selected_repo_files:
             all_trades.append(df)
 
+    # -- Helper to check session state existence
+    def state_exists(keys):
+        return all(k in st.session_state for k in keys)
+
     # --- Build trades DataFrame and mapping only on initial load or after update ---
     if all_trades:
         trades = pd.concat(all_trades, ignore_index=True)
@@ -187,10 +195,9 @@ with tabs[0]:
 
         # On initial load or when trade report selection changes, reload session state tables
         if (
-            STATIC_TRADES_KEY not in st.session_state
-            or st.session_state[STATIC_TRADES_KEY] is None
-            or st.session_state.get("last_selection") != selected_repo_files
-            or st.session_state.get("last_uploaded_files") != [f.name for f in uploaded_files] if uploaded_files else []
+            not state_exists([STATIC_TRADES_KEY, STATIC_UNMAPPED_KEY, STATIC_MAPPED_KEY, STATIC_MAPPING_KEY, LAST_SELECTION_KEY, LAST_UPLOADED_KEY])
+            or st.session_state[LAST_SELECTION_KEY] != selected_repo_files
+            or st.session_state[LAST_UPLOADED_KEY] != uploaded_names
         ):
             trades['yahoo_ticker'] = trades.apply(lambda row: map_ticker_for_row(row, user_mappings), axis=1)
             unmapped = trades[trades['yahoo_ticker'] == ""][['scrip_code', 'company_name']].drop_duplicates()
@@ -206,13 +213,13 @@ with tabs[0]:
             st.session_state[STATIC_UNMAPPED_KEY] = unmapped.reset_index(drop=True)
             st.session_state[STATIC_MAPPED_KEY] = mapped.reset_index(drop=True)
             st.session_state[STATIC_MAPPING_KEY] = mapping_df
-            st.session_state["last_selection"] = selected_repo_files
-            st.session_state["last_uploaded_files"] = [f.name for f in uploaded_files] if uploaded_files else []
+            st.session_state[LAST_SELECTION_KEY] = selected_repo_files
+            st.session_state[LAST_UPLOADED_KEY] = uploaded_names
 
-        trades = st.session_state[STATIC_TRADES_KEY]
-        unmapped = st.session_state[STATIC_UNMAPPED_KEY]
-        mapped = st.session_state[STATIC_MAPPED_KEY]
-        mapping_df = st.session_state[STATIC_MAPPING_KEY]
+        trades = st.session_state.get(STATIC_TRADES_KEY)
+        unmapped = st.session_state.get(STATIC_UNMAPPED_KEY)
+        mapped = st.session_state.get(STATIC_MAPPED_KEY)
+        mapping_df = st.session_state.get(STATIC_MAPPING_KEY)
 
         st.success(f"Loaded {len(trades)} trades from {len(all_trades)} report(s).")
         st.write("First 5 rows of combined trades:", trades.head())
