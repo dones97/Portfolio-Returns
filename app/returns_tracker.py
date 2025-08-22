@@ -70,8 +70,11 @@ def default_bse_mapping(scrip_code):
 
 def yahoo_ticker_valid(ticker):
     try:
-        data = yf.Ticker(ticker).history(period="1d")
-        return not data.empty
+        info = yf.Ticker(ticker).info
+        return (
+            info.get('symbol', '').upper() == ticker.upper() or
+            info.get('shortName') or info.get('longName')
+        )
     except Exception:
         return False
 
