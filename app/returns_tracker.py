@@ -36,91 +36,31 @@ def default_bse_mapping(scrip_code):
         return f"{s.zfill(6)}.BO"
     return None
 
-def yahoo_ticker_valid(ticker, timeout=5):
-    """
-    Improved validation:
-      1) Try yf.Ticker(ticker).info (fast) and look for useful fields.
-      2) Try history(period='5d') or history(period='1mo') to catch thin tickers.
-      3) As a final fallback try yf.download for the last 30 days (start/end).
-    Returns True if we see non-empty info or non-empty history/data.
-    """
-    if not ticker or not isinstance(ticker, str):
-        return False
-    tstr = ticker.strip().upper()
+def yahoo_ticker_valid(ticker):
     try:
-        t = yf.Ticker(tstr)
-        # 1) info check (many tickers return useful fields here)
-        try:
-            info = t.info or {}
-        except Exception:
-            info = {}
-        if info and (info.get("shortName") or info.get("regularMarketPrice") is not None or info.get("symbol")):
-            return True
-
-        # 2) try short history (5d) then 1mo
-        for p in ("5d", "1mo"):
-            try:
-                hist = t.history(period=p, timeout=timeout)
-                if hist is not None and not hist.empty:
-                    return True
-            except Exception:
-                # ignore and try next
-                pass
-
-        # 3) fallback: try yf.download for last 30 days with explicit start/end
-        try:
-            end = pd.Timestamp.today()
-            start = end - pd.Timedelta(days=30)
-            df = yf.download(tstr, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"),
-                             progress=False, auto_adjust=False, timeout=timeout)
-            if df is not None and not df.empty:
-                return True
-        except Exception:
-            pass
-
-        return False
+        data = yf.Ticker(ticker).history(period="1d")
+        return not data.empty
     except Exception:
         return False
 
-def map_ticker_for_row(row, user_mappings):
-    """
-    Map a single trade report row (expects 'scrip_code' and optional 'company_name').
-    Priority:
-      1) user_mappings (persistent csv)
-      2) default_bse_mapping (numeric -> zero-padded 6-digit .BO)
-      3) if default_map fails, try raw code + .BO, code as-is, and a couple common variants
-    Returns ticker string or "" if not resolved.
-    """
-    code = str(row.get('scrip_code', '')).strip()
-    if not code:
+def get_yahoo_stock_name(ticker):
+    try:
+        info = yf.Ticker(ticker).info
+        name = info.get("shortName") or info.get("longName") or info.get("name")
+        if name:
+            return name
+        # fallback to symbol if nothing else
+        return info.get("symbol", "")
+    except Exception:
         return ""
-    # 1) explicit user mapping
+
+def map_ticker_for_row(row, user_mappings):
+    code = str(row['scrip_code']).strip()
     if code in user_mappings:
         return user_mappings[code]
-
-    # 2) default BSE numeric mapping (existing behavior)
     default_map = default_bse_mapping(code)
     if default_map and yahoo_ticker_valid(default_map):
         return default_map
-
-    # 3) try other common variants (explicit attempts) - lowers false negatives
-    cand = code.upper()
-    candidates = []
-    # if code looks numeric try unpadded and padded variants
-    if code.replace('.', '', 1).isdigit():
-        if cand.endswith('.0'):
-            cand = cand[:-2]
-        candidates.extend([f"{cand.zfill(6)}.BO", f"{cand}.BO", cand])
-    else:
-        # alpha codes: try with common exchange suffixes
-        candidates.extend([cand, f"{cand}.NS", f"{cand}.BO"])
-
-    # try candidates
-    for c in candidates:
-        if c and yahoo_ticker_valid(c):
-            return c
-
-    # unresolved: return empty so UI can ask user
     return ""
 
 def read_trade_report(file):
@@ -208,9 +148,7 @@ if all_trades:
 
     unmapped = trades[trades['yahoo_ticker'] == ""][['scrip_code', 'company_name']].drop_duplicates()
     st.subheader("Unmapped Scrip Codes")
-    # Debug: show first 20 unmapped codes for inspection
     if not unmapped.empty:
-        st.write("Sample unmapped (first 20) for inspection:", unmapped.head(20))
         st.write("For these codes, enter the correct Yahoo ticker (e.g., 'RELIANCE.NS' or '543306.BO').")
         edited = st.data_editor(
             unmapped.assign(yahoo_ticker=""),
@@ -239,7 +177,10 @@ if all_trades:
     else:
         st.success("All scrip codes mapped successfully!")
 
-    mapped = trades[trades['yahoo_ticker'] != ""]
+    mapped = trades[trades['yahoo_ticker'] != ""].copy()
+    # Add Yahoo stock name column
+    mapped['yahoo_stock_name'] = mapped['yahoo_ticker'].apply(get_yahoo_stock_name)
+
     st.subheader("Mapped Trades")
     st.write(mapped)
 
