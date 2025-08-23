@@ -9,3 +9,4 @@ setuptools>=65.5.1
 openpyxl>=3.0.10
 xlrd>=2.0.1
 python-dateutil>=2.8.2
+numpy-financial
