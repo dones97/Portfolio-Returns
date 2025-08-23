@@ -3,6 +3,9 @@ import pandas as pd
 import yfinance as yf
 import os
 from glob import glob
+import numpy as np
+import numpy_financial as npf
+import datetime
 
 # --- CONFIGURATION ---
 
@@ -156,6 +159,70 @@ def calc_realized_unrealized_avgcost(df):
 
     return realized_df, unrealized_df, total_realized, total_unrealized
 
+def inr_format(amount):
+    # Indian formatting for lakhs and crores, no decimals
+    if amount is None or pd.isna(amount):
+        return "₹0"
+    amount = int(round(amount))
+    s = str(amount)
+    if len(s) <= 3:
+        return f"₹{s}"
+    else:
+        last3 = s[-3:]
+        rest = s[:-3]
+        groups = []
+        while len(rest) > 2:
+            groups.append(rest[-2:])
+            rest = rest[:-2]
+        if rest:
+            groups.append(rest)
+        formatted = ','.join(reversed(groups)) + ',' + last3
+        return f"₹{formatted}"
+
+def color_pct(pct):
+    pct = round(pct, 2)
+    color = "green" if pct >= 0 else "red"
+    return f'<span style="color:{color}; font-weight:bold">{pct}%</span>'
+
+def get_cashflows_for_xirr(df, unrealized_df):
+    # Buys: negative cashflow on buy date
+    # Sells: positive cashflow on sell date
+    # Unrealized: add final value as positive cashflow on today
+    cfs = []
+    for _, row in df.iterrows():
+        qty = float(row["quantity"])
+        price = float(row["price"])
+        dt = pd.to_datetime(row["date"])
+        if row["side"].lower() == "buy":
+            cfs.append({"date": dt, "amount": -qty * price})
+        elif row["side"].lower() == "sell":
+            cfs.append({"date": dt, "amount": qty * price})
+    # Add final value of all unrealized holdings as cashflow on today
+    today = pd.Timestamp(datetime.date.today())
+    for _, row in unrealized_df.iterrows():
+        qty = float(row["Quantity"])
+        curr_price = float(row["Current Price"]) if row["Current Price"] != "N/A" else 0
+        if qty > 0 and curr_price > 0:
+            cfs.append({"date": today, "amount": qty * curr_price})
+    # Sort by date
+    cfs = sorted(cfs, key=lambda x: x["date"])
+    dates = [x["date"] for x in cfs]
+    amounts = [x["amount"] for x in cfs]
+    return amounts, dates
+
+def get_nifty500_cagr(start_dt, end_dt):
+    try:
+        ticker = "^CRSLNX50"
+        nifty = yf.Ticker(ticker)
+        hist = nifty.history(start=start_dt, end=end_dt + datetime.timedelta(days=1))
+        start_val = hist.iloc[0]["Close"]
+        end_val = hist.iloc[-1]["Close"]
+        years = (end_dt - start_dt).days / 365.25
+        cagr = (end_val / start_val) ** (1 / years) - 1
+        return start_val, end_val, years, cagr * 100
+    except Exception:
+        return None, None, None, None
+
 # --- MAIN APP UI ---
 
 st.title("Portfolio Ticker Mapping & Storage Demo (Excel + Historical Reports)")
@@ -270,6 +337,52 @@ This app maps your scrip codes to Yahoo Finance tickers.<br>
 with tabs[1]:
     st.header("Portfolio Returns")
     st.info("Returns are calculated only from the saved portfolio history. Click 'Save Portfolio History' in the previous tab after mapping trades.")
+
+    if os.path.exists(PORTFOLIO_HISTORY_CSV):
+    history_df = pd.read_csv(PORTFOLIO_HISTORY_CSV)
+    required_cols = {"yahoo_ticker", "side", "quantity", "price", "date"}
+    if required_cols.issubset(history_df.columns):
+        realized_df, unrealized_df, total_realized, total_unrealized = calc_realized_unrealized_avgcost(history_df)
+
+        # Headline Takeaway Section
+        st.subheader("Portfolio Headline Performance")
+
+        # (1) XIRR
+        cashflow_amounts, cashflow_dates = get_cashflows_for_xirr(history_df, unrealized_df)
+        try:
+            xirr = npf.xirr(cashflow_amounts, cashflow_dates) * 100
+            xirr_str = color_pct(xirr)
+        except Exception:
+            xirr_str = "<span style='color:gray;'>N/A</span>"
+
+        # (2) Current Portfolio Value
+        curr_value = unrealized_df["Profit/Loss Value"] + unrealized_df["Average Buy Price"] * unrealized_df["Quantity"]
+        curr_value = unrealized_df.apply(lambda row: float(row["Quantity"]) * (float(row["Current Price"]) if row["Current Price"] != "N/A" else 0), axis=1).sum()
+        curr_value_str = inr_format(curr_value)
+
+        # (3) Nifty 500 Index CAGR
+        # Use first cashflow date and today
+        if cashflow_dates and len(cashflow_dates) > 1:
+            start_dt = cashflow_dates[0]
+            end_dt = cashflow_dates[-1]
+            start_val, end_val, years, nifty_cagr = get_nifty500_cagr(start_dt, end_dt)
+            if nifty_cagr is not None:
+                nifty_cagr_str = color_pct(nifty_cagr)
+            else:
+                nifty_cagr_str = "<span style='color:gray;'>N/A</span>"
+        else:
+            nifty_cagr_str = "<span style='color:gray;'>N/A</span>"
+
+        st.markdown(f"""
+        <div style="padding:1em; border-radius:8px; background:#f6f6f6; box-shadow:0 1px 2px #ccc;">
+        <h2 style="margin-bottom:.5em;">Your Portfolio at a Glance</h2>
+        <ul style="font-size:1.2em;">
+        <li><b>XIRR (Annualized Return):</b> {xirr_str}</li>
+        <li><b>Current Portfolio Value:</b> {curr_value_str}</li>
+        <li><b>Nifty 500 Index CAGR:</b> {nifty_cagr_str}</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
 
     # Load portfolio history from csv
     if os.path.exists(PORTFOLIO_HISTORY_CSV):
