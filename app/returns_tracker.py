@@ -317,7 +317,7 @@ def compute_current_portfolio_value(history_df):
 # --- MAIN APP UI ---
 
 st.set_page_config(page_title="Portfolio Returns Tracker", layout="wide")
-st.title("Portfolio Returns - Invested amount based headline")
+st.title("Portfolio Returns Tracker")
 
 st.markdown("""
 This version avoids relying on historical stock prices for beginning/end valuations (which can be missing on Yahoo).
@@ -409,7 +409,7 @@ Upload or select trade reports, map scrip codes to Yahoo tickers and save the po
     st.dataframe(mapping_df)
 
 with tabs[1]:
-    st.header("Portfolio Returns (invested-amount approach)")
+    st.header("Portfolio Returns")
 
     if not os.path.exists(PORTFOLIO_HISTORY_CSV):
         st.warning("No portfolio_history.csv found. Save mapped trades from Trade Mapping tab first.")
@@ -493,7 +493,7 @@ with tabs[1]:
             st.markdown(nifty_cagr_str, unsafe_allow_html=True)
 
         # Secondary headline: total-return based metrics
-        st.markdown("### Total invested-based metrics (simple)")
+        st.markdown("### Total invested-based metrics")
         col_a, col_b, col_c = st.columns(3)
         with col_a:
             st.markdown("Total Money Invested (Buys)")
