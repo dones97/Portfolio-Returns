@@ -117,11 +117,11 @@ def inr_format(amount):
 
 def color_pct(pct):
     try:
-        pct = round(float(pct), 2)
+        pct = float(pct)
     except:
         pct = 0
     color = "green" if pct >= 0 else "red"
-    return f'<span style="color:{color}; font-weight:bold">{pct}%</span>'
+    return f'<span style="color:{color}; font-weight:bold">{round(pct,2)}%</span>'
 
 # --- PORTFOLIO RETURNS HELPER FUNCTIONS ---
 
@@ -163,8 +163,8 @@ def calc_realized_unrealized_avgcost(df):
             result_realized.append({
                 "Ticker": ticker,
                 "Quantity": realized_qty,
-                "Average Buy Price": round(avg_buy_price, 2),
-                "Average Sell Price": round(avg_sell_price, 2),
+                "Average Buy Price": avg_buy_price,
+                "Average Sell Price": avg_sell_price,
                 "Profit/Loss Value": realized_pl_value,
                 "Profit/Loss %": realized_pl_pct
             })
@@ -180,8 +180,8 @@ def calc_realized_unrealized_avgcost(df):
             result_unrealized.append({
                 "Ticker": ticker,
                 "Quantity": unrealized_qty,
-                "Average Buy Price": round(avg_buy_price, 2),
-                "Current Price": round(current_price, 2) if current_price is not None else "N/A",
+                "Average Buy Price": avg_buy_price,
+                "Current Price": current_price if current_price is not None else "N/A",
                 "Profit/Loss Value": unrealized_pl_value if unrealized_pl_value is not None else "N/A",
                 "Profit/Loss %": unrealized_pl_pct if unrealized_pl_pct is not None else "N/A"
             })
@@ -219,9 +219,9 @@ def get_cashflows_for_xirr(df, unrealized_df):
     amounts = [x["amount"] for x in cfs]
     return amounts, dates
 
-def get_nifty500_cagr(start_dt, end_dt):
+def get_nifty50_cagr(start_dt, end_dt):
     try:
-        ticker = "^CRSLNX50"
+        ticker = "^NSEI"
         nifty = yf.Ticker(ticker)
         hist = nifty.history(start=start_dt, end=end_dt + datetime.timedelta(days=1))
         start_val = hist.iloc[0]["Close"]
@@ -229,7 +229,8 @@ def get_nifty500_cagr(start_dt, end_dt):
         years = (end_dt - start_dt).days / 365.25
         cagr = (end_val / start_val) ** (1 / years) - 1
         return start_val, end_val, years, cagr * 100
-    except Exception:
+    except Exception as e:
+        print("Nifty50 history error:", e)
         return None, None, None, None
 
 # --- MAIN APP UI ---
@@ -350,7 +351,6 @@ with tabs[1]:
     # Load portfolio history from csv
     if os.path.exists(PORTFOLIO_HISTORY_CSV):
         history_df = pd.read_csv(PORTFOLIO_HISTORY_CSV)
-        # Try to ensure date is datetime
         if "date" in history_df.columns:
             history_df["date"] = pd.to_datetime(history_df["date"])
         required_cols = {"yahoo_ticker", "side", "quantity", "price", "date"}
@@ -366,7 +366,20 @@ with tabs[1]:
                 xirr = npf.xirr(cashflow_amounts, cashflow_dates) * 100
                 xirr_str = color_pct(xirr)
             except Exception:
-                xirr_str = "<span style='color:gray;'>N/A</span>"
+                # fallback to simple CAGR if XIRR is not possible
+                if len(cashflow_dates) > 1:
+                    start_dt = cashflow_dates[0]
+                    end_dt = cashflow_dates[-1]
+                    start_val = abs(cashflow_amounts[0])
+                    end_val = sum(cashflow_amounts)
+                    years = (end_dt - start_dt).days / 365.25
+                    if years > 0 and start_val > 0 and end_val > 0:
+                        cagr = (end_val / start_val) ** (1 / years) - 1
+                        xirr_str = color_pct(cagr * 100)
+                    else:
+                        xirr_str = "<span style='color:gray;'>N/A</span>"
+                else:
+                    xirr_str = "<span style='color:gray;'>N/A</span>"
 
             # (2) Current Portfolio Value
             curr_value = unrealized_df.apply(
@@ -374,11 +387,11 @@ with tabs[1]:
             ).sum()
             curr_value_str = inr_format(curr_value)
 
-            # (3) Nifty 500 Index CAGR
+            # (3) Nifty 50 Index CAGR
             if cashflow_dates and len(cashflow_dates) > 1:
                 start_dt = cashflow_dates[0]
                 end_dt = cashflow_dates[-1]
-                start_val, end_val, years, nifty_cagr = get_nifty500_cagr(start_dt, end_dt)
+                start_val, end_val, years, nifty_cagr = get_nifty50_cagr(start_dt, end_dt)
                 if nifty_cagr is not None:
                     nifty_cagr_str = color_pct(nifty_cagr)
                 else:
@@ -395,24 +408,27 @@ with tabs[1]:
                 st.markdown("**Current Portfolio Value:**")
                 st.markdown(f"{curr_value_str}", unsafe_allow_html=True)
             with col3:
-                st.markdown("**Nifty 500 Index CAGR:**")
+                st.markdown("**Nifty 50 Index CAGR:**")
                 st.markdown(f"{nifty_cagr_str}", unsafe_allow_html=True)
 
-            # Realized Returns Table - scrollable
+            # Realized Returns Table - scrollable, styled
             st.subheader("Realized Returns (Average Costing)")
             if not realized_df.empty:
                 realized_df_fmt = realized_df.copy()
                 realized_df_fmt["Profit/Loss Value"] = realized_df_fmt["Profit/Loss Value"].apply(inr_format)
-                realized_df_fmt["Profit/Loss %"] = realized_df_fmt["Profit/Loss %"].apply(color_pct)
+                realized_df_fmt["Profit/Loss %"] = realized_df_fmt["Profit/Loss %"].apply(lambda x: round(x,2))
                 realized_df_fmt["Average Buy Price"] = realized_df_fmt["Average Buy Price"].apply(inr_format)
                 realized_df_fmt["Average Sell Price"] = realized_df_fmt["Average Sell Price"].apply(inr_format)
                 realized_df_fmt["Quantity"] = realized_df_fmt["Quantity"].astype(int)
-                st.dataframe(realized_df_fmt, height=400)
+                styled_realized = realized_df_fmt.style.applymap(
+                    lambda v: 'color:green; font-weight:bold' if v >= 0 else 'color:red; font-weight:bold', subset=['Profit/Loss %']
+                ).format({'Profit/Loss %': '{:.2f}%'})
+                st.write(styled_realized.set_table_attributes('style="height:400px;overflow-y:auto"').to_html(), unsafe_allow_html=True)
                 st.markdown(f"**Total Realized Profit/Loss:** {inr_format(total_realized)}")
             else:
                 st.info("No realized trades or profit/loss yet.")
 
-            # Unrealized Returns Table - scrollable
+            # Unrealized Returns Table - scrollable, styled
             st.subheader("Unrealized Returns (Average Costing)")
             if not unrealized_df.empty:
                 unrealized_df_fmt = unrealized_df.copy()
@@ -420,14 +436,21 @@ with tabs[1]:
                     lambda x: inr_format(x) if x != "N/A" else "N/A"
                 )
                 unrealized_df_fmt["Profit/Loss %"] = unrealized_df_fmt["Profit/Loss %"].apply(
-                    lambda x: color_pct(x) if x != "N/A" else "<span style='color:gray;'>N/A</span>"
+                    lambda x: round(x,2) if x != "N/A" else "N/A"
                 )
                 unrealized_df_fmt["Average Buy Price"] = unrealized_df_fmt["Average Buy Price"].apply(inr_format)
                 unrealized_df_fmt["Current Price"] = unrealized_df_fmt["Current Price"].apply(
                     lambda x: inr_format(x) if x != "N/A" else "N/A"
                 )
                 unrealized_df_fmt["Quantity"] = unrealized_df_fmt["Quantity"].astype(int)
-                st.dataframe(unrealized_df_fmt, height=400)
+                # Style only rows with numeric Profit/Loss %
+                def style_unrealized_pct(val):
+                    try:
+                        return 'color:green; font-weight:bold' if float(val) >= 0 else 'color:red; font-weight:bold'
+                    except:
+                        return ''
+                styled_unrealized = unrealized_df_fmt.style.applymap(style_unrealized_pct, subset=['Profit/Loss %']).format({'Profit/Loss %': '{:.2f}%'})
+                st.write(styled_unrealized.set_table_attributes('style="height:400px;overflow-y:auto"').to_html(), unsafe_allow_html=True)
                 st.markdown(f"**Total Unrealized Profit/Loss:** {inr_format(total_unrealized)}")
             else:
                 st.info("No unrealized holdings.")
