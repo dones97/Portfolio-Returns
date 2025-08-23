@@ -69,11 +69,15 @@ def read_trade_report(file):
         "Quantity": "quantity",
         "Price": "price",
         "Side": "side",
-        "Buy/Sell": "side"
+        "Buy/Sell": "side",
+        "Date": "date",
+        "date": "date"
     }
     df = df.rename(columns={c: colmap[c] for c in df.columns if c in colmap})
     df['scrip_code'] = df['scrip_code'].astype(str).str.strip()
     df['company_name'] = df['company_name'].astype(str).str.strip()
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
     return df
 
 def get_repository_trade_reports():
@@ -88,6 +92,37 @@ def get_repository_trade_reports():
         except Exception as e:
             st.warning(f"Could not read {file}: {e}")
     return reports
+
+# --- INR Formatting and Color Helper ---
+
+def inr_format(amount):
+    # Indian formatting for lakhs and crores, no decimals
+    try:
+        amount = int(round(float(amount)))
+    except:
+        return "₹0"
+    s = str(amount)
+    if len(s) <= 3:
+        return f"₹{s}"
+    else:
+        last3 = s[-3:]
+        rest = s[:-3]
+        groups = []
+        while len(rest) > 2:
+            groups.append(rest[-2:])
+            rest = rest[:-2]
+        if rest:
+            groups.append(rest)
+        formatted = ','.join(reversed(groups)) + ',' + last3
+        return f"₹{formatted}"
+
+def color_pct(pct):
+    try:
+        pct = round(float(pct), 2)
+    except:
+        pct = 0
+    color = "green" if pct >= 0 else "red"
+    return f'<span style="color:{color}; font-weight:bold">{pct}%</span>'
 
 # --- PORTFOLIO RETURNS HELPER FUNCTIONS ---
 
@@ -131,8 +166,8 @@ def calc_realized_unrealized_avgcost(df):
                 "Quantity": realized_qty,
                 "Average Buy Price": round(avg_buy_price, 2),
                 "Average Sell Price": round(avg_sell_price, 2),
-                "Profit/Loss Value": round(realized_pl_value, 2),
-                "Profit/Loss %": round(realized_pl_pct, 2)
+                "Profit/Loss Value": realized_pl_value,
+                "Profit/Loss %": realized_pl_pct
             })
 
         # Unrealized portion: remaining holding at avg buy price
@@ -148,8 +183,8 @@ def calc_realized_unrealized_avgcost(df):
                 "Quantity": unrealized_qty,
                 "Average Buy Price": round(avg_buy_price, 2),
                 "Current Price": round(current_price, 2) if current_price is not None else "N/A",
-                "Profit/Loss Value": round(unrealized_pl_value, 2) if unrealized_pl_value is not None else "N/A",
-                "Profit/Loss %": round(unrealized_pl_pct, 2) if unrealized_pl_pct is not None else "N/A"
+                "Profit/Loss Value": unrealized_pl_value if unrealized_pl_value is not None else "N/A",
+                "Profit/Loss %": unrealized_pl_pct if unrealized_pl_pct is not None else "N/A"
             })
 
     realized_df = pd.DataFrame(result_realized)
@@ -158,31 +193,6 @@ def calc_realized_unrealized_avgcost(df):
     total_unrealized = unrealized_df["Profit/Loss Value"].replace("N/A", 0).astype(float).sum() if not unrealized_df.empty else 0
 
     return realized_df, unrealized_df, total_realized, total_unrealized
-
-def inr_format(amount):
-    # Indian formatting for lakhs and crores, no decimals
-    if amount is None or pd.isna(amount):
-        return "₹0"
-    amount = int(round(amount))
-    s = str(amount)
-    if len(s) <= 3:
-        return f"₹{s}"
-    else:
-        last3 = s[-3:]
-        rest = s[:-3]
-        groups = []
-        while len(rest) > 2:
-            groups.append(rest[-2:])
-            rest = rest[:-2]
-        if rest:
-            groups.append(rest)
-        formatted = ','.join(reversed(groups)) + ',' + last3
-        return f"₹{formatted}"
-
-def color_pct(pct):
-    pct = round(pct, 2)
-    color = "green" if pct >= 0 else "red"
-    return f'<span style="color:{color}; font-weight:bold">{pct}%</span>'
 
 def get_cashflows_for_xirr(df, unrealized_df):
     # Buys: negative cashflow on buy date
@@ -338,67 +348,91 @@ with tabs[1]:
     st.header("Portfolio Returns")
     st.info("Returns are calculated only from the saved portfolio history. Click 'Save Portfolio History' in the previous tab after mapping trades.")
 
-    if os.path.exists(PORTFOLIO_HISTORY_CSV):
-    history_df = pd.read_csv(PORTFOLIO_HISTORY_CSV)
-    required_cols = {"yahoo_ticker", "side", "quantity", "price", "date"}
-    if required_cols.issubset(history_df.columns):
-        realized_df, unrealized_df, total_realized, total_unrealized = calc_realized_unrealized_avgcost(history_df)
-
-        # Headline Takeaway Section
-        st.subheader("Portfolio Headline Performance")
-
-        # (1) XIRR
-        cashflow_amounts, cashflow_dates = get_cashflows_for_xirr(history_df, unrealized_df)
-        try:
-            xirr = npf.xirr(cashflow_amounts, cashflow_dates) * 100
-            xirr_str = color_pct(xirr)
-        except Exception:
-            xirr_str = "<span style='color:gray;'>N/A</span>"
-
-        # (2) Current Portfolio Value
-        curr_value = unrealized_df["Profit/Loss Value"] + unrealized_df["Average Buy Price"] * unrealized_df["Quantity"]
-        curr_value = unrealized_df.apply(lambda row: float(row["Quantity"]) * (float(row["Current Price"]) if row["Current Price"] != "N/A" else 0), axis=1).sum()
-        curr_value_str = inr_format(curr_value)
-
-        # (3) Nifty 500 Index CAGR
-        # Use first cashflow date and today
-        if cashflow_dates and len(cashflow_dates) > 1:
-            start_dt = cashflow_dates[0]
-            end_dt = cashflow_dates[-1]
-            start_val, end_val, years, nifty_cagr = get_nifty500_cagr(start_dt, end_dt)
-            if nifty_cagr is not None:
-                nifty_cagr_str = color_pct(nifty_cagr)
-            else:
-                nifty_cagr_str = "<span style='color:gray;'>N/A</span>"
-        else:
-            nifty_cagr_str = "<span style='color:gray;'>N/A</span>"
-
-        st.markdown(f"""
-        <div style="padding:1em; border-radius:8px; background:#f6f6f6; box-shadow:0 1px 2px #ccc;">
-        <h2 style="margin-bottom:.5em;">Your Portfolio at a Glance</h2>
-        <ul style="font-size:1.2em;">
-        <li><b>XIRR (Annualized Return):</b> {xirr_str}</li>
-        <li><b>Current Portfolio Value:</b> {curr_value_str}</li>
-        <li><b>Nifty 500 Index CAGR:</b> {nifty_cagr_str}</li>
-        </ul>
-        </div>
-        """, unsafe_allow_html=True)
-
     # Load portfolio history from csv
     if os.path.exists(PORTFOLIO_HISTORY_CSV):
         history_df = pd.read_csv(PORTFOLIO_HISTORY_CSV)
-        required_cols = {"yahoo_ticker", "side", "quantity", "price"}
+        # Try to ensure date is datetime
+        if "date" in history_df.columns:
+            history_df["date"] = pd.to_datetime(history_df["date"])
+        required_cols = {"yahoo_ticker", "side", "quantity", "price", "date"}
         if required_cols.issubset(history_df.columns):
             realized_df, unrealized_df, total_realized, total_unrealized = calc_realized_unrealized_avgcost(history_df)
 
+            # Headline Takeaway Section
+            st.subheader("Portfolio Headline Performance")
+
+            # (1) XIRR
+            cashflow_amounts, cashflow_dates = get_cashflows_for_xirr(history_df, unrealized_df)
+            try:
+                xirr = npf.xirr(cashflow_amounts, cashflow_dates) * 100
+                xirr_str = color_pct(xirr)
+            except Exception:
+                xirr_str = "<span style='color:gray;'>N/A</span>"
+
+            # (2) Current Portfolio Value
+            curr_value = unrealized_df.apply(
+                lambda row: float(row["Quantity"]) * (float(row["Current Price"]) if row["Current Price"] != "N/A" else 0), axis=1
+            ).sum()
+            curr_value_str = inr_format(curr_value)
+
+            # (3) Nifty 500 Index CAGR
+            if cashflow_dates and len(cashflow_dates) > 1:
+                start_dt = cashflow_dates[0]
+                end_dt = cashflow_dates[-1]
+                start_val, end_val, years, nifty_cagr = get_nifty500_cagr(start_dt, end_dt)
+                if nifty_cagr is not None:
+                    nifty_cagr_str = color_pct(nifty_cagr)
+                else:
+                    nifty_cagr_str = "<span style='color:gray;'>N/A</span>"
+            else:
+                nifty_cagr_str = "<span style='color:gray;'>N/A</span>"
+
+            st.markdown(f"""
+            <div style="padding:1em; border-radius:8px; background:#f6f6f6; box-shadow:0 1px 2px #ccc;">
+            <h2 style="margin-bottom:.5em;">Your Portfolio at a Glance</h2>
+            <ul style="font-size:1.2em;">
+            <li><b>XIRR (Annualized Return):</b> {xirr_str}</li>
+            <li><b>Current Portfolio Value:</b> {curr_value_str}</li>
+            <li><b>Nifty 500 Index CAGR:</b> {nifty_cagr_str}</li>
+            </ul>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Realized Returns Table
             st.subheader("Realized Returns (Average Costing)")
-            st.dataframe(realized_df)
-            st.markdown(f"**Total Realized Profit/Loss:** {round(total_realized,2)}")
+            if not realized_df.empty:
+                realized_df_fmt = realized_df.copy()
+                realized_df_fmt["Profit/Loss Value"] = realized_df_fmt["Profit/Loss Value"].apply(inr_format)
+                realized_df_fmt["Profit/Loss %"] = realized_df_fmt["Profit/Loss %"].apply(color_pct)
+                realized_df_fmt["Average Buy Price"] = realized_df_fmt["Average Buy Price"].apply(inr_format)
+                realized_df_fmt["Average Sell Price"] = realized_df_fmt["Average Sell Price"].apply(inr_format)
+                realized_df_fmt["Quantity"] = realized_df_fmt["Quantity"].astype(int)
+                st.write(realized_df_fmt.to_html(escape=False, index=False), unsafe_allow_html=True)
+                st.markdown(f"**Total Realized Profit/Loss:** {inr_format(total_realized)}")
+            else:
+                st.info("No realized trades or profit/loss yet.")
 
+            # Unrealized Returns Table
             st.subheader("Unrealized Returns (Average Costing)")
-            st.dataframe(unrealized_df)
-            st.markdown(f"**Total Unrealized Profit/Loss:** {round(total_unrealized,2)}")
+            if not unrealized_df.empty:
+                unrealized_df_fmt = unrealized_df.copy()
+                unrealized_df_fmt["Profit/Loss Value"] = unrealized_df_fmt["Profit/Loss Value"].apply(
+                    lambda x: inr_format(x) if x != "N/A" else "N/A"
+                )
+                unrealized_df_fmt["Profit/Loss %"] = unrealized_df_fmt["Profit/Loss %"].apply(
+                    lambda x: color_pct(x) if x != "N/A" else "<span style='color:gray;'>N/A</span>"
+                )
+                unrealized_df_fmt["Average Buy Price"] = unrealized_df_fmt["Average Buy Price"].apply(inr_format)
+                unrealized_df_fmt["Current Price"] = unrealized_df_fmt["Current Price"].apply(
+                    lambda x: inr_format(x) if x != "N/A" else "N/A"
+                )
+                unrealized_df_fmt["Quantity"] = unrealized_df_fmt["Quantity"].astype(int)
+                st.write(unrealized_df_fmt.to_html(escape=False, index=False), unsafe_allow_html=True)
+                st.markdown(f"**Total Unrealized Profit/Loss:** {inr_format(total_unrealized)}")
+            else:
+                st.info("No unrealized holdings.")
 
+            # Main Takeaway
             if not realized_df.empty or not unrealized_df.empty:
                 main_takeaway = ""
                 if total_realized >= 0 and total_unrealized >= 0:
@@ -411,6 +445,6 @@ with tabs[1]:
                     main_takeaway = "You have realized losses, but unrealized holdings are in profit."
                 st.success(main_takeaway)
         else:
-            st.error(f"Portfolio history file missing required columns: {required_cols}")
+            st.error(f"Portfolio history file missing required columns: {required_cols} (including 'date').")
     else:
         st.warning("No portfolio history saved yet. Go to Trade Mapping tab and click 'Save Portfolio History' after mapping trades.")
