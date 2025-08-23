@@ -532,17 +532,6 @@ with tabs[1]:
             rf["Average Sell Price INR"] = rf["Average Sell Price"].apply(inr_format)
             rf_display = rf[["Ticker", "Quantity", "Average Buy Price INR", "Average Sell Price INR", "Profit/Loss Value INR", "Profit/Loss % (num)"]]
             st.dataframe(rf_display, height=20 * 28)
-            # styled expander for colored % column
-            with st.expander("Styled Realized Table (colored %)", expanded=False):
-                styled = rf.copy()
-                styled["Profit/Loss Value INR"] = styled["Profit/Loss Value"].apply(inr_format)
-                styled["Profit/Loss %"] = styled["Profit/Loss %"].apply(lambda x: color_pct_html(x))
-                styled = styled.rename(columns={
-                    "Average Buy Price": "Average Buy Price (₹)",
-                    "Average Sell Price": "Average Sell Price (₹)"
-                })
-                st.write(styled.to_html(escape=False, index=False), unsafe_allow_html=True)
-            st.markdown(f"**Total Realized Profit/Loss:** {inr_format(total_realized)}")
         else:
             st.info("No realized trades or profit/loss yet.")
 
@@ -561,12 +550,6 @@ with tabs[1]:
             uf["Current Price INR"] = uf["Current Price"].apply(lambda x: inr_format(x) if x != "N/A" else "N/A")
             uf_display = uf[["Ticker", "Quantity", "Average Buy Price INR", "Current Price INR", "Profit/Loss Value INR", "Profit/Loss % (num)"]]
             st.dataframe(uf_display, height=20 * 28)
-            with st.expander("Styled Unrealized Table (colored %)", expanded=False):
-                styled = uf.copy()
-                styled["Profit/Loss Value INR"] = styled["Profit/Loss Value"].apply(lambda x: inr_format(x) if x != "N/A" else "N/A")
-                styled["Profit/Loss %"] = styled["Profit/Loss %"].apply(lambda x: color_pct_html(x) if x != "N/A" else "<span style='color:gray;'>N/A</span>")
-                st.write(styled.to_html(escape=False, index=False), unsafe_allow_html=True)
-            st.markdown(f"**Total Unrealized Profit/Loss:** {inr_format(total_unrealized)}")
         else:
             st.info("No unrealized holdings.")
 
