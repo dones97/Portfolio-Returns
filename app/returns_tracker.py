@@ -8,7 +8,6 @@ import numpy_financial as npf
 import datetime
 
 # --- CONFIGURATION ---
-
 MAPPINGS_CSV = "ticker_mappings.csv"
 TRADE_REPORTS_DIR = "trade_reports"
 PORTFOLIO_HISTORY_CSV = "portfolio_history.csv"
@@ -387,18 +386,19 @@ with tabs[1]:
             else:
                 nifty_cagr_str = "<span style='color:gray;'>N/A</span>"
 
-            st.markdown(f"""
-            <div style="padding:1em; border-radius:8px; background:#f6f6f6; box-shadow:0 1px 2px #ccc;">
-            <h2 style="margin-bottom:.5em;">Your Portfolio at a Glance</h2>
-            <ul style="font-size:1.2em;">
-            <li><b>XIRR (Annualized Return):</b> {xirr_str}</li>
-            <li><b>Current Portfolio Value:</b> {curr_value_str}</li>
-            <li><b>Nifty 500 Index CAGR:</b> {nifty_cagr_str}</li>
-            </ul>
-            </div>
-            """, unsafe_allow_html=True)
+            # Simple, bold, three-column headline
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown("**XIRR (Annualized Return):**")
+                st.markdown(f"{xirr_str}", unsafe_allow_html=True)
+            with col2:
+                st.markdown("**Current Portfolio Value:**")
+                st.markdown(f"{curr_value_str}", unsafe_allow_html=True)
+            with col3:
+                st.markdown("**Nifty 500 Index CAGR:**")
+                st.markdown(f"{nifty_cagr_str}", unsafe_allow_html=True)
 
-            # Realized Returns Table
+            # Realized Returns Table - scrollable
             st.subheader("Realized Returns (Average Costing)")
             if not realized_df.empty:
                 realized_df_fmt = realized_df.copy()
@@ -407,12 +407,12 @@ with tabs[1]:
                 realized_df_fmt["Average Buy Price"] = realized_df_fmt["Average Buy Price"].apply(inr_format)
                 realized_df_fmt["Average Sell Price"] = realized_df_fmt["Average Sell Price"].apply(inr_format)
                 realized_df_fmt["Quantity"] = realized_df_fmt["Quantity"].astype(int)
-                st.write(realized_df_fmt.to_html(escape=False, index=False), unsafe_allow_html=True)
+                st.dataframe(realized_df_fmt, height=400)
                 st.markdown(f"**Total Realized Profit/Loss:** {inr_format(total_realized)}")
             else:
                 st.info("No realized trades or profit/loss yet.")
 
-            # Unrealized Returns Table
+            # Unrealized Returns Table - scrollable
             st.subheader("Unrealized Returns (Average Costing)")
             if not unrealized_df.empty:
                 unrealized_df_fmt = unrealized_df.copy()
@@ -427,7 +427,7 @@ with tabs[1]:
                     lambda x: inr_format(x) if x != "N/A" else "N/A"
                 )
                 unrealized_df_fmt["Quantity"] = unrealized_df_fmt["Quantity"].astype(int)
-                st.write(unrealized_df_fmt.to_html(escape=False, index=False), unsafe_allow_html=True)
+                st.dataframe(unrealized_df_fmt, height=400)
                 st.markdown(f"**Total Unrealized Profit/Loss:** {inr_format(total_unrealized)}")
             else:
                 st.info("No unrealized holdings.")
