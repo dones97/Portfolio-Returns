@@ -507,10 +507,6 @@ with tabs[1]:
 
         if total_return_pct is not None:
             st.markdown(f"Total Return: <b>{inr_format(total_return_amt)}</b> ({color_pct_html(total_return_pct)})", unsafe_allow_html=True)
-            if cagr_simple_pct is not None:
-                st.markdown(f"Approx. CAGR on net invested (using first buy as start): {color_pct_html(cagr_simple_pct)}", unsafe_allow_html=True)
-            else:
-                st.markdown("Approx. CAGR: N/A (insufficient time data)", unsafe_allow_html=True)
         else:
             st.markdown("<span style='color:gray;'>No net invested capital found (buys minus sells <= 0) — cannot compute total return/CAGR.</span>", unsafe_allow_html=True)
 
