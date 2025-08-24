@@ -6,14 +6,13 @@ from glob import glob
 import numpy as np
 import datetime
 import altair as alt
-from functools import lru_cache
 
 # --- CONFIG ---
 MAPPINGS_CSV = "ticker_mappings.csv"
 TRADE_REPORTS_DIR = "trade_reports"
 PORTFOLIO_HISTORY_CSV = "portfolio_history.csv"
 
-# --- HELPERS: IO / MAPPINGS / TRADE READ ---
+# --- TICKER MAPPING / IO ---
 
 def load_user_mappings():
     if os.path.exists(MAPPINGS_CSV):
@@ -86,7 +85,7 @@ def get_repository_trade_reports():
             st.warning(f"Could not read {file}: {e}")
     return reports
 
-# --- INR formatting ---
+# --- FORMATTING ---
 
 def inr_format(amount):
     try:
@@ -128,6 +127,7 @@ def get_prev_trading_price(ticker, target_date):
     key = ("hist", ticker, target_day.strftime("%Y-%m-%d"))
     if key in _price_cache:
         return _price_cache[key]
+    # wider window for safety
     start = (target_day - pd.Timedelta(days=40)).strftime("%Y-%m-%d")
     end = (target_day + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     try:
@@ -283,7 +283,7 @@ def get_price_for_date_with_fallback(ticker, target_date, history_df):
             return last_price, "last_trade"
     return None, None
 
-# --- Build calendar-year metrics from trades (no strict reliance on Yahoo) ---
+# --- Calendar-year metrics from trades (robust) ---
 
 def compute_yearly_metrics_from_trades(history_df):
     if history_df.empty:
@@ -382,7 +382,7 @@ def compute_yearly_metrics_from_trades(history_df):
 
     return results, missing_prices
 
-# --- Nifty yearly returns for a set of years (single fetch) ---
+# --- Nifty 50 yearly returns for given years (single fetch; same index as headline: ^NSEI) ---
 
 def compute_nifty_yearly_returns(years):
     if not years:
@@ -417,7 +417,7 @@ def compute_nifty_yearly_returns(years):
     except Exception:
         return {}
 
-# --- P&L time series (cumulative total = realized + unrealized estimate via last trade prices) ---
+# --- P&L timeline (cumulative total = realized + unrealized estimate using last trade prices) ---
 
 def pnl_over_time(history_df):
     df = history_df.copy().sort_values("date")
@@ -474,24 +474,22 @@ def pnl_over_time(history_df):
     ).sort_values("date").reset_index(drop=True)
     return out
 
-# --- MAIN APP ---
+# --- STREAMLIT UI ---
 
 st.set_page_config(page_title="Portfolio Returns Tracker", layout="wide")
 st.title("Portfolio Returns")
 
-st.markdown("Compute headline and calendar-year comparisons (Portfolio vs Nifty 50), plus cumulative portfolio profits over time.")
-
 tabs = st.tabs(["Trade Mapping", "Portfolio Returns"])
 
 with tabs[0]:
-    st.markdown("Upload and map trade reports. Save mapped trades to portfolio_history.csv for the returns tab to use.", unsafe_allow_html=True)
+    st.markdown("Upload or select trade reports, map scrip codes to Yahoo tickers, and save the portfolio history.", unsafe_allow_html=True)
 
     user_mappings = load_user_mappings()
-    uploaded_files = st.file_uploader("Upload your trade reports (Excel)", type=["xlsx"], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Upload trade reports (Excel)", type=["xlsx"], accept_multiple_files=True)
 
     repo_reports = get_repository_trade_reports()
     repo_file_names = [fname for fname, _ in repo_reports] if repo_reports else []
-    selected_repo_files = st.multiselect("Select repo trade reports to include", repo_file_names, default=[])
+    selected_repo_files = st.multiselect("Select repository trade reports to include", repo_file_names, default=[])
 
     all_trades = []
     if uploaded_files:
@@ -550,9 +548,9 @@ with tabs[0]:
                 st.warning("portfolio_history.csv already exists. Check the overwrite box to overwrite.")
             else:
                 mapped.to_csv(PORTFOLIO_HISTORY_CSV, index=False)
-                st.success("Saved portfolio_history.csv. Returns tab will use this file.")
+                st.success("Saved portfolio_history.csv.")
     else:
-        st.info("Upload trades or select repo trade reports to start mapping.")
+        st.info("Upload trades or pick from repository to begin.")
 
     st.markdown("---")
     st.subheader("Current Mappings")
@@ -560,10 +558,10 @@ with tabs[0]:
     st.dataframe(mapping_df)
 
 with tabs[1]:
-    st.header("Portfolio Returns (from saved history)")
+    st.header("Portfolio Returns")
 
     if not os.path.exists(PORTFOLIO_HISTORY_CSV):
-        st.warning("No portfolio_history.csv found. Save mapped trades from Trade Mapping tab first.")
+        st.warning("No portfolio_history.csv found. Save mapped trades first.")
         st.stop()
 
     history_df = pd.read_csv(PORTFOLIO_HISTORY_CSV)
@@ -576,8 +574,9 @@ with tabs[1]:
         st.error(f"portfolio_history.csv missing columns: {required_cols - set(history_df.columns)}")
         st.stop()
 
-    # Headline: realized/unrealized + XIRR + benchmark CAGR
+    # Headline metrics
     realized_df, unrealized_df, total_realized, total_unrealized = calc_realized_unrealized_avgcost(history_df)
+
     curr_value = unrealized_df.apply(
         lambda row: float(row["Quantity"]) * (float(row["Current Price"]) if row["Current Price"] != "N/A" else 0), axis=1
     ).sum() if not unrealized_df.empty else 0.0
@@ -596,7 +595,6 @@ with tabs[1]:
     # XIRR
     cashflows = build_cashflows_from_history(history_df)
     irr_str = "<span style='color:gray;'>N/A</span>"
-    irr_val = None
     if cashflows:
         amounts = [amt for amt, _ in cashflows]
         dates = [dt for _, dt in cashflows]
@@ -608,26 +606,26 @@ with tabs[1]:
                 import numpy_financial as npf
                 irr_val = npf.xirr(amounts, dates) * 100.0
             except Exception:
-                def simple_xirr(amts, dts):
-                    d0 = pd.to_datetime(dts[0])
-                    times = np.array([(pd.to_datetime(d) - d0).days / 365.0 for d in dts], dtype=float)
-                    amts_np = np.array(amts, dtype=float)
-                    def f(r): return np.sum(amts_np / ((1.0 + r) ** times))
-                    def fp(r): return np.sum(-amts_np * times / ((1.0 + r) ** (times + 1.0)))
-                    r = 0.1
-                    for _ in range(200):
-                        val = f(r); der = fp(r)
-                        if der == 0: break
-                        step = val / der
-                        r -= step
-                        if abs(step) < 1e-6: return r
-                    raise ArithmeticError("xirr did not converge")
-                irr_val = simple_xirr(amounts, dates) * 100.0
-            irr_str = color_pct_html(irr_val) if irr_val is not None else irr_str
+                # simple Newton fallback
+                d0 = pd.to_datetime(dates[0])
+                times = np.array([(pd.to_datetime(d) - d0).days / 365.0 for d in dates], dtype=float)
+                amts = np.array(amounts, dtype=float)
+                def f(r): return np.sum(amts / ((1.0 + r) ** times))
+                def fp(r): return np.sum(-amts * times / ((1.0 + r) ** (times + 1.0)))
+                r = 0.1
+                for _ in range(200):
+                    val = f(r); der = fp(r)
+                    if der == 0: break
+                    step = val / der
+                    r -= step
+                    if abs(step) < 1e-6: 
+                        irr_val = r * 100.0
+                        break
+            irr_str = color_pct_html(irr_val) if 'irr_val' in locals() and irr_val is not None else irr_str
         except Exception:
-            irr_val = None
             irr_str = "<span style='color:gray;'>N/A</span>"
 
+    # Nifty 50 CAGR headline (same index we'll use for yearly)
     first_trade = history_df["date"].min()
     last_trade = history_df["date"].max()
     nifty_cagr_val = None
@@ -678,7 +676,7 @@ with tabs[1]:
 
     st.markdown("---")
 
-    # --- Calendar-year comparison: Portfolio vs Nifty (two bars per year + labels) ---
+    # --- Calendar-year comparison: grouped bars (Portfolio vs Nifty 50) ---
     st.subheader("Portfolio vs Nifty 50: Yearly Comparison (calendar years)")
 
     per_year_results, missing_prices = compute_yearly_metrics_from_trades(history_df)
@@ -687,19 +685,21 @@ with tabs[1]:
     else:
         per_year_df = pd.DataFrame(per_year_results)
         years_list = per_year_df["year"].astype(int).tolist()
-        nifty_year_map = compute_nifty_yearly_returns(years_list)
-        per_year_df["nifty_pct"] = per_year_df["year"].map(nifty_year_map)
+        nifty_map = compute_nifty_yearly_returns(years_list)
+        per_year_df["nifty_pct"] = per_year_df["year"].map(nifty_map)
 
-        # Build chart data
+        # build chart data - two rows per year
         chart_rows = []
         for _, r in per_year_df.iterrows():
             yr = int(r["year"])
-            if r["return_pct"] is not None and not pd.isna(r["return_pct"]):
-                chart_rows.append({"year": yr, "series": "Portfolio", "return_pct": float(r["return_pct"])})
-            if r["nifty_pct"] is not None and not pd.isna(r["nifty_pct"]):
-                chart_rows.append({"year": yr, "series": "Nifty 50", "return_pct": float(r["nifty_pct"])})
-        chart_df = pd.DataFrame(chart_rows)
+            port_val = r["return_pct"]
+            nifty_val = r["nifty_pct"]
+            if port_val is not None and not pd.isna(port_val):
+                chart_rows.append({"year": yr, "series": "Portfolio", "return_pct": float(port_val)})
+            if nifty_val is not None and not pd.isna(nifty_val):
+                chart_rows.append({"year": yr, "series": "Nifty 50 (^NSEI)", "return_pct": float(nifty_val)})
 
+        chart_df = pd.DataFrame(chart_rows)
         if not chart_df.empty:
             chart_df["label"] = chart_df["return_pct"].round(1).astype(str) + "%"
 
@@ -708,43 +708,29 @@ with tabs[1]:
                 y=alt.Y("return_pct:Q", title="Return %"),
                 color=alt.Color("series:N", title="Series"),
                 xOffset=alt.XOffset("series:N"),
-                tooltip=[
-                    alt.Tooltip("year:O", title="Year"),
-                    alt.Tooltip("series:N", title="Series"),
-                    alt.Tooltip("return_pct:Q", title="Return %", format=".2f")
-                ]
+                tooltip=[alt.Tooltip("year:O", title="Year"),
+                         alt.Tooltip("series:N", title="Series"),
+                         alt.Tooltip("return_pct:Q", title="Return %", format=".2f")]
             )
-            # labels for both bars
-            text = alt.Chart(chart_df).mark_text(fontSize=11).encode(
-                x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
-                y=alt.Y("return_pct:Q"),
-                text=alt.Text("label:N"),
-                xOffset=alt.XOffset("series:N"),
-                color=alt.value("#111")
-            ).transform_calculate(
-                dy_offset="datum.return_pct >= 0 ? -6 : 12"
-            ).transform_calculate(
-                label= "datum.label"
-            ).encode()
-            # Altair can't use transform_calculate value for dy directly in encode, so split into two layers
+            # labels above/below bars
             text_pos = alt.Chart(chart_df[chart_df["return_pct"] >= 0]).mark_text(dy=-6, fontSize=11).encode(
                 x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
                 y=alt.Y("return_pct:Q"),
                 text=alt.Text("label:N"),
-                xOffset=alt.XOffset("series:N"),
+                xOffset=alt.XOffset("series:N")
             )
             text_neg = alt.Chart(chart_df[chart_df["return_pct"] < 0]).mark_text(dy=12, fontSize=11).encode(
                 x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
                 y=alt.Y("return_pct:Q"),
                 text=alt.Text("label:N"),
-                xOffset=alt.XOffset("series:N"),
+                xOffset=alt.XOffset("series:N")
             )
             chart = (bars + text_pos + text_neg).properties(height=420)
             st.altair_chart(chart, use_container_width=True)
         else:
             st.info("No yearly returns available to plot.")
 
-        # Calendar-year table (just the rows that exist)
+        # calendar-year table (only the data rows)
         display_rows = []
         for _, r in per_year_df.iterrows():
             display_rows.append({
@@ -762,19 +748,19 @@ with tabs[1]:
         st.dataframe(year_table_df)
 
         if missing_prices:
-            st.warning("For some tickers, Yahoo historical prices were missing—used last trade price fallback for those dates. Examples (ticker, date):")
+            st.warning("Used last trade price fallback when Yahoo historical prices were missing for some tickers/dates.")
             st.write(sorted(list(set(missing_prices)))[:20])
 
     st.markdown("---")
 
-    # --- Cumulative portfolio profit over time (total = realized + unrealized estimate) ---
+    # --- Cumulative portfolio profit over time (Total = realized + unrealized estimate) ---
     st.subheader("Cumulative Portfolio Profit Over Time (INR)")
 
     pnl_ts = pnl_over_time(history_df)
     if pnl_ts.empty:
         st.info("No trades found to build profit timeline.")
     else:
-        # Indian axis labels (K/L/Cr)
+        # Axis that shows Indian units (K/L/Cr)
         axis_indian = alt.Axis(
             title="Cumulative Profit (₹)",
             labelExpr=(
@@ -784,29 +770,28 @@ with tabs[1]:
             )
         )
 
-        # Prepare a folded dataset to show legend (Total as area, Realized as line)
+        # Fold to show legend (Total as area, Realized as line)
         fold_df = pnl_ts.melt(id_vars=["date"], value_vars=["total_pnl", "realized_cum"],
                               var_name="series", value_name="value")
-        # Area for Total P&L
+
+        color_scale = alt.Scale(domain=["total_pnl", "realized_cum"], range=["#1f77b4", "#d62728"])
+
         area = alt.Chart(fold_df[fold_df["series"] == "total_pnl"]).mark_area(opacity=0.35).encode(
             x=alt.X("date:T", title="Date"),
             y=alt.Y("value:Q", axis=axis_indian),
-            color=alt.Color("series:N", title="Series", scale=alt.Scale(
-                domain=["total_pnl", "realized_cum"], range=["#1f77b4", "#d62728"]
-            )),
+            color=alt.Color("series:N", title="Series", scale=color_scale),
             tooltip=[alt.Tooltip("date:T", title="Date"),
                      alt.Tooltip("value:Q", title="Total P&L (₹)", format=",.0f")]
         )
-        # Line for Realized
+
         line = alt.Chart(fold_df[fold_df["series"] == "realized_cum"]).mark_line(strokeWidth=2).encode(
             x=alt.X("date:T", title="Date"),
             y=alt.Y("value:Q", axis=axis_indian),
-            color=alt.Color("series:N", title="Series", scale=alt.Scale(
-                domain=["total_pnl", "realized_cum"], range=["#1f77b4", "#d62728"]
-            )),
+            color=alt.Color("series:N", title="Series", scale=color_scale),
             tooltip=[alt.Tooltip("date:T", title="Date"),
                      alt.Tooltip("value:Q", title="Realized (₹)", format=",.0f")]
         )
+
         chart_pnl = (area + line).properties(height=320)
         st.altair_chart(chart_pnl, use_container_width=True)
 
@@ -820,7 +805,7 @@ with tabs[1]:
 
     st.markdown("---")
 
-    # --- Realized / Unrealized tables (sortable, no styled variants) ---
+    # --- Realized / Unrealized tables (no styled variants) ---
     st.subheader("Realized Returns (Average Costing)")
     if not realized_df.empty:
         rf = realized_df.copy()
@@ -841,7 +826,7 @@ with tabs[1]:
         uf["Profit/Loss Value INR"] = uf["Profit/Loss Value"].apply(lambda x: inr_format(x) if x != "N/A" else "N/A")
         uf["Average Buy Price INR"] = uf["Average Buy Price"].apply(inr_format)
         uf["Current Price INR"] = uf["Current Price"].apply(lambda x: inr_format(x) if x != "N/A" else "N/A")
-        # numerical for sorting
+        # numeric for sorting
         def to_num(x):
             try:
                 return float(x)
