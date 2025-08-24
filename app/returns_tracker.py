@@ -134,8 +134,8 @@ _price_cache = {}
 
 def get_prev_trading_price(ticker, target_date):
     """
-    Get closing price for ticker on or before target_date.
-    Returns None when not found. Caches results.
+    Try to fetch close price on or before target_date from Yahoo.
+    Caches results. Returns None if not available.
     """
     if not isinstance(target_date, (pd.Timestamp, datetime.date, datetime.datetime)):
         target_date = pd.to_datetime(target_date)
@@ -289,17 +289,62 @@ def compute_realized_pl_by_year(history_df):
                 pos[ticker]["cost"] = avg_cost * remaining_qty
     return realized_by_year
 
-# --- Modified Dietz per-year using historical prices where available ---
-def compute_modified_dietz_for_year(history_df, year):
-    start_dt = pd.Timestamp(datetime.date(year, 1, 1))
-    end_dt = pd.Timestamp(datetime.date(year, 12, 31))
-    # holdings as of start (strictly before start_dt)
+# --- Fallback price resolution: Yahoo historical -> last trade price <= date in history_df ---
+
+def get_price_for_date_with_fallback(ticker, target_date, history_df):
+    """
+    Resolve a reasonable price for ticker on target_date:
+      1) Try Yahoo prev trading close
+      2) Fallback to the last trade price in history_df at or before that date
+      3) If none, return None
+    """
+    price = get_prev_trading_price(ticker, target_date)
+    if price is not None:
+        return price, "yahoo"
+    # fallback: find last trade price for that ticker on or before target_date
+    if history_df is not None:
+        mask = (history_df['yahoo_ticker'] == ticker) & (history_df['date'] <= pd.to_datetime(target_date))
+        trades = history_df.loc[mask].sort_values('date')
+        if not trades.empty:
+            last_price = float(trades.iloc[-1]['price'])
+            return last_price, "last_trade"
+    return None, None
+
+# --- Per-year metrics computed by simulating trades and using fallback prices ---
+
+def compute_yearly_metrics_from_trades(history_df):
+    """
+    For each calendar year present in history_df:
+      - compute BMV (holdings before year start) using fallback prices
+      - compute EMV (holdings at year end) using fallback prices
+      - compute net_flows (buys positive, sells negative)
+      - compute total_return_amt = EMV - BMV - net_flows
+      - compute realized_by_year via average-cost simulation
+      - compute unrealized = total_return_amt - realized
+      - compute return_pct = total_return_amt / avg_portfolio_val if reasonable
+    Returns list of dicts per year and list of missing_price tuples
+    """
+    if history_df.empty:
+        return [], []
+
+    history_df = history_df.copy().sort_values('date')
+    history_df['date'] = pd.to_datetime(history_df['date'])
+    first_year = history_df['date'].dt.year.min()
+    last_year = history_df['date'].dt.year.max()
+    years = list(range(first_year, last_year + 1))
+
+    realized_by_year = compute_realized_pl_by_year(history_df)
+
+    missing_prices = []
+    results = []
+
+    # helper to compute holdings as of a date
     def holdings_as_of(dt, inclusive=False):
         if inclusive:
-            mask = history_df['date'] <= dt
+            mask = history_df['date'] <= pd.to_datetime(dt)
         else:
-            mask = history_df['date'] < dt
-        sub = history_df[mask].dropna(subset=['yahoo_ticker'])
+            mask = history_df['date'] < pd.to_datetime(dt)
+        sub = history_df.loc[mask].dropna(subset=['yahoo_ticker'])
         net = {}
         for t, grp in sub.groupby('yahoo_ticker'):
             buy_qty = grp[grp['side'].str.lower() == 'buy']['quantity'].astype(float).sum()
@@ -307,66 +352,73 @@ def compute_modified_dietz_for_year(history_df, year):
             net[t] = buy_qty - sell_qty
         return net
 
-    b_holdings = holdings_as_of(start_dt, inclusive=False)
-    e_holdings = holdings_as_of(end_dt, inclusive=True)
+    for y in years:
+        start_dt = pd.Timestamp(datetime.date(y, 1, 1))
+        end_dt = pd.Timestamp(datetime.date(y, 12, 31))
+        b_hold = holdings_as_of(start_dt, inclusive=False)
+        e_hold = holdings_as_of(end_dt, inclusive=True)
 
-    BMV = 0.0
-    EMV = 0.0
-    missing = []
-    for t, q in b_holdings.items():
-        if q == 0:
-            continue
-        p = get_prev_trading_price(t, start_dt)
-        if p is None:
-            missing.append((t, start_dt.date()))
-            continue
-        BMV += q * p
-    for t, q in e_holdings.items():
-        if q == 0:
-            continue
-        p = get_prev_trading_price(t, end_dt)
-        if p is None:
-            missing.append((t, end_dt.date()))
-            continue
-        EMV += q * p
+        BMV = 0.0
+        EMV = 0.0
 
-    # cash flows during year: buys positive invested, sells negative withdrawn (for denominator logic)
-    mask_year = (history_df['date'] >= start_dt) & (history_df['date'] <= (end_dt + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)))
-    df_year = history_df[mask_year].copy()
-    cashflows = []
-    cashflow_dates = []
-    for _, r in df_year.iterrows():
-        amt = float(r['quantity']) * float(r['price'])
-        if str(r['side']).strip().lower().startswith("buy"):
-            cf = amt
+        # value beginning holdings using fallback price
+        for t, qty in b_hold.items():
+            if qty == 0:
+                continue
+            price, src = get_price_for_date_with_fallback(t, start_dt, history_df)
+            if price is None:
+                missing_prices.append((t, start_dt.date()))
+                continue
+            BMV += qty * price
+
+        # value ending holdings using fallback price
+        for t, qty in e_hold.items():
+            if qty == 0:
+                continue
+            price, src = get_price_for_date_with_fallback(t, end_dt, history_df)
+            if price is None:
+                missing_prices.append((t, end_dt.date()))
+                continue
+            EMV += qty * price
+
+        # cashflows during year: buys positive invested, sells negative withdrawn
+        mask_year = (history_df['date'] >= start_dt) & (history_df['date'] <= (end_dt + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)))
+        df_year = history_df.loc[mask_year]
+        net_flows = 0.0
+        for _, r in df_year.iterrows():
+            amt = float(r['quantity']) * float(r['price'])
+            if str(r['side']).strip().lower().startswith("buy"):
+                net_flows += amt
+            else:
+                net_flows -= amt
+
+        total_return_amt = EMV - BMV - net_flows
+        avg_portfolio_val = (BMV + EMV) / 2.0 if (BMV + EMV) != 0 else None
+
+        # Compute percent: prefer dividing by avg_portfolio_val; if not available, fall back to net_flows if net_flows>0
+        if avg_portfolio_val and avg_portfolio_val > 0:
+            return_pct = (total_return_amt / avg_portfolio_val) * 100.0
+        elif net_flows > 0:
+            return_pct = (total_return_amt / net_flows) * 100.0
         else:
-            cf = -amt
-        cashflows.append(cf)
-        cashflow_dates.append(pd.to_datetime(r['date']))
+            return_pct = None
 
-    period_days = (end_dt - start_dt).days + 1
-    numerator = EMV - BMV - sum(cashflows)
-    weighted_flows = 0.0
-    for cf, dt in zip(cashflows, cashflow_dates):
-        days_remaining = (end_dt - pd.to_datetime(dt)).days
-        w = days_remaining / period_days
-        weighted_flows += w * cf
-    denominator = BMV + weighted_flows
+        realized_amt = realized_by_year.get(y, 0.0)
+        unrealized_amt = total_return_amt - realized_amt
 
-    if abs(denominator) < 1e-9:
-        return_pct = None
-    else:
-        return_pct = numerator / denominator
+        results.append({
+            "year": y,
+            "BMV": BMV,
+            "EMV": EMV,
+            "net_flows": net_flows,
+            "total_return_amt": total_return_amt,
+            "return_pct": return_pct,
+            "realized_amt": realized_amt,
+            "unrealized_amt": unrealized_amt,
+            "avg_portfolio_val": avg_portfolio_val
+        })
 
-    return {
-        "year": year,
-        "BMV": BMV,
-        "EMV": EMV,
-        "net_flows": sum(cashflows),
-        "total_return_amt": numerator,
-        "return_pct": return_pct,
-        "missing_prices": missing
-    }
+    return results, missing_prices
 
 # --- Yearly Nifty returns (per calendar year) ---
 @lru_cache(maxsize=64)
@@ -392,10 +444,6 @@ def nifty_year_return(year):
 # --- Realized profit time series (cumulative) ---
 
 def realized_profit_time_series(history_df):
-    """
-    Returns DataFrame with columns: date, realized_on_date, cumulative_realized
-    Realized is computed using average-cost at time of sell (running simulation).
-    """
     df = history_df.copy().sort_values("date")
     rows = []
     pos = {}
@@ -418,7 +466,6 @@ def realized_profit_time_series(history_df):
             avg_cost = (pos[ticker]["cost"] / pos[ticker]["qty"]) if pos[ticker]["qty"] > 0 else 0.0
             realized = qty * (price - avg_cost)
             cum += realized
-            # reduce position
             remaining_qty = pos[ticker]["qty"] - qty
             if remaining_qty <= 0:
                 pos[ticker]["qty"] = 0.0
@@ -440,10 +487,9 @@ st.set_page_config(page_title="Portfolio Returns Tracker", layout="wide")
 st.title("Portfolio Returns")
 
 st.markdown("""
-This page now adds:
-- A split next to total return showing realized vs unrealized contributions (INR and % of net invested).
-- A clustered column chart comparing portfolio vs Nifty-50 per calendar year.
-- An area chart showing cumulative realized profits over time.
+This version avoids relying solely on Yahoo historical prices for beginning/end-of-year valuations.
+When Yahoo prices are missing we fall back to the last trade price on or before the target date from your trade history.
+Per-year metrics are computed by simulating the trade history year-by-year.
 """)
 
 tabs = st.tabs(["Trade Mapping", "Portfolio Returns"])
@@ -577,12 +623,11 @@ with tabs[1]:
         amounts.append(curr_value)
         dates.append(today)
         try:
-            # Use npf.xirr if available, else fallback to our own quick solver
             try:
                 import numpy_financial as npf
                 irr_val = npf.xirr(amounts, dates) * 100.0
             except Exception:
-                # fallback Newton implementation (simple)
+                # fallback Newton implementation
                 def simple_xirr(amounts, dates):
                     d0 = pd.to_datetime(dates[0])
                     times = np.array([(pd.to_datetime(d) - d0).days / 365.0 for d in dates], dtype=float)
@@ -614,7 +659,6 @@ with tabs[1]:
     nifty_cagr_val = None
     try:
         if pd.notnull(first_trade) and pd.notnull(last_trade) and (last_trade > first_trade):
-            nifty_cagr_val = None
             try:
                 ticker = "^NSEI"
                 hist = yf.Ticker(ticker).history(start=first_trade.strftime("%Y-%m-%d"),
@@ -671,60 +715,51 @@ with tabs[1]:
     # --- Per-year comparison: portfolio vs Nifty (clustered column)
     st.subheader("Portfolio vs Nifty 50: Yearly Comparison (calendar years)")
 
-    # Years range from first_trade.year to last_trade.year
-    start_year = int(first_trade.year)
-    end_year = int(last_trade.year)
-    years = list(range(start_year, end_year + 1))
+    per_year_results, missing_prices = compute_yearly_metrics_from_trades(history_df)
 
-    # Compute per-year portfolio return using Modified Dietz where possible (falls back to realized-based % if missing)
-    per_year_rows = []
-    any_missing = []
-    realized_by_year = compute_realized_pl_by_year(history_df)
-
-    for y in years:
-        md = compute_modified_dietz_for_year(history_df, y)
-        # modified dietz return_pct is decimal; convert to percent
-        port_ret_pct = md.get("return_pct")
-        if port_ret_pct is not None:
-            port_ret_pct = port_ret_pct * 100.0
-        else:
-            # fallback: use realized_by_year / simple base if available
-            mask_y = (history_df['date'].dt.year == y)
-            buys_y = history_df[mask_y & history_df['side'].str.lower().str.startswith("buy")]
-            buys_amt = (buys_y['quantity'].astype(float) * buys_y['price'].astype(float)).sum()
-            if buys_amt > 0:
-                port_ret_pct = (realized_by_year.get(y, 0.0) / buys_amt) * 100.0
-            else:
-                port_ret_pct = None
-        # Nifty year return
-        nifty_ret = nifty_year_return(y)
-        if md.get("missing_prices"):
-            any_missing.extend(md.get("missing_prices"))
-        per_year_rows.append({"year": y, "portfolio_pct": port_ret_pct, "nifty_pct": nifty_ret})
-
-    per_year_df = pd.DataFrame(per_year_rows)
-
-    # Prepare data for Altair clustered chart
-    chart_df = per_year_df.melt(id_vars=["year"], value_vars=["portfolio_pct", "nifty_pct"],
-                                var_name="series", value_name="return_pct")
-    # map series names
-    chart_df['series'] = chart_df['series'].map({"portfolio_pct": "Portfolio", "nifty_pct": "Nifty 50"})
-    # Drop NaNs for plotting (Altair can't plot None)
-    chart_plot_df = chart_df.dropna(subset=['return_pct'])
-
-    if not chart_plot_df.empty:
-        base = alt.Chart(chart_plot_df).mark_bar().encode(
-            x=alt.X('year:O', title='Year'),
-            y=alt.Y('return_pct:Q', title='Return %'),
-            color=alt.Color('series:N', title='Series')
-        ).properties(width=80 * len(years), height=360)
-        st.altair_chart(base, use_container_width=True)
+    if not per_year_results:
+        st.info("No per-year results could be computed from trade history.")
     else:
-        st.info("Yearly comparison not available (insufficient data or missing historical prices).")
+        per_year_df = pd.DataFrame(per_year_results)
+        # Add nifty year returns
+        per_year_df['nifty_pct'] = per_year_df['year'].apply(lambda y: nifty_year_return(y))
+        # build chart data
+        chart_rows = []
+        for _, r in per_year_df.iterrows():
+            chart_rows.append({"year": int(r['year']), "series": "Portfolio", "return_pct": (r['return_pct'] if r['return_pct'] is not None else np.nan)})
+            chart_rows.append({"year": int(r['year']), "series": "Nifty 50", "return_pct": (r['nifty_pct'] if r['nifty_pct'] is not None else np.nan)})
+        chart_df = pd.DataFrame(chart_rows).dropna(subset=['return_pct'])
+        if not chart_df.empty:
+            chart = alt.Chart(chart_df).mark_bar().encode(
+                x=alt.X('year:O', title='Year'),
+                y=alt.Y('return_pct:Q', title='Return %'),
+                color=alt.Color('series:N', title='Series'),
+                tooltip=[alt.Tooltip('year:O', title='Year'), alt.Tooltip('series:N', title='Series'), alt.Tooltip('return_pct:Q', title='Return %')]
+            ).properties(height=420)
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("No yearly returns available to plot (all NaN).")
 
-    if any_missing:
-        st.warning("Some tickers had missing historical prices for BMV/EMV when computing per-year portfolio returns. Those years may be partial or approximated. Missing examples (ticker, date):")
-        st.write(list(set(any_missing))[:10])
+        if missing_prices:
+            st.warning("Some tickers were missing Yahoo historical prices; we used the last trade price from your history as a fallback for those dates. Examples (ticker, date):")
+            st.write(sorted(list(set(missing_prices)))[:20])
+
+        # Show per-year table with realized/unrealized split
+        display_rows = []
+        for r in per_year_results:
+            display_rows.append({
+                "Year": r["year"],
+                "BMV": inr_format(r["BMV"]),
+                "EMV": inr_format(r["EMV"]),
+                "Net Flows (₹)": inr_format(r["net_flows"]),
+                "Total Return (₹)": inr_format(r["total_return_amt"]),
+                "Return (%)": f"{round(r['return_pct'],2)}%" if r["return_pct"] is not None else "N/A",
+                "Realized (₹)": inr_format(r["realized_amt"]),
+                "Unrealized (₹)": inr_format(r["unrealized_amt"]),
+                "Avg Portfolio Value (₹)": inr_format(r["avg_portfolio_val"]) if r["avg_portfolio_val"] else "N/A"
+            })
+        year_table_df = pd.DataFrame(display_rows)
+        st.dataframe(year_table_df, height=20 * 28)
 
     st.markdown("---")
 
@@ -735,7 +770,6 @@ with tabs[1]:
     if realized_ts.empty:
         st.info("No realized sells found to build profit timeline.")
     else:
-        # build area chart with Altair
         realized_ts_sorted = realized_ts.sort_values("date").reset_index(drop=True)
         chart = alt.Chart(realized_ts_sorted).mark_area(opacity=0.35).encode(
             x=alt.X('date:T', title='Date'),
@@ -744,7 +778,6 @@ with tabs[1]:
         ).properties(width='100%', height=300)
         st.altair_chart(chart, use_container_width=True)
 
-        # also show the underlying table in case user wants numbers
         with st.expander("Show realized profit timeline table"):
             rt = realized_ts_sorted.copy()
             rt["date"] = rt["date"].dt.date
@@ -801,4 +834,4 @@ with tabs[1]:
         st.info("No unrealized holdings.")
 
     st.markdown("---")
-    st.success("Done. The charts above compare yearly portfolio returns vs Nifty 50 and show cumulative realized profits over time.")
+    st.success("Done. Per-year returns now use trade-history-first fallback pricing; this avoids missing-Yahoo issues and yields sensible realized/unrealized splits.")
