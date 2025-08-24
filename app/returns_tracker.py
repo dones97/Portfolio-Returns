@@ -1,3 +1,4 @@
+# Full updated app file with fixes for Altair sizing and grouped bars + labels
 import streamlit as st
 import pandas as pd
 import yfinance as yf
@@ -134,8 +135,8 @@ _price_cache = {}
 
 def get_prev_trading_price(ticker, target_date):
     """
-    Try to fetch close price on or before target_date from Yahoo.
-    Caches results. Returns None if not available.
+    Get closing price for ticker on or before target_date.
+    Returns None when not found. Caches results.
     """
     if not isinstance(target_date, (pd.Timestamp, datetime.date, datetime.datetime)):
         target_date = pd.to_datetime(target_date)
@@ -712,7 +713,7 @@ with tabs[1]:
 
     st.markdown("---")
 
-    # --- Per-year comparison: portfolio vs Nifty (clustered column)
+    # --- Per-year comparison: portfolio vs Nifty (clustered column) ---
     st.subheader("Portfolio vs Nifty 50: Yearly Comparison (calendar years)")
 
     per_year_results, missing_prices = compute_yearly_metrics_from_trades(history_df)
@@ -726,16 +727,30 @@ with tabs[1]:
         # build chart data
         chart_rows = []
         for _, r in per_year_df.iterrows():
-            chart_rows.append({"year": int(r['year']), "series": "Portfolio", "return_pct": (r['return_pct'] if r['return_pct'] is not None else np.nan)})
-            chart_rows.append({"year": int(r['year']), "series": "Nifty 50", "return_pct": (r['nifty_pct'] if r['nifty_pct'] is not None else np.nan)})
+            # Ensure numeric return_pct (or NaN)
+            port_pct = r['return_pct'] if (r['return_pct'] is not None and not pd.isna(r['return_pct'])) else np.nan
+            nifty_pct = r['nifty_pct'] if (r['nifty_pct'] is not None and not pd.isna(r['nifty_pct'])) else np.nan
+            chart_rows.append({"year": int(r['year']), "series": "Portfolio", "return_pct": port_pct})
+            chart_rows.append({"year": int(r['year']), "series": "Nifty 50", "return_pct": nifty_pct})
         chart_df = pd.DataFrame(chart_rows).dropna(subset=['return_pct'])
         if not chart_df.empty:
-            chart = alt.Chart(chart_df).mark_bar().encode(
+            # Use xOffset to group bars by series for each year, and add text labels
+            bars = alt.Chart(chart_df).mark_bar().encode(
                 x=alt.X('year:O', title='Year'),
                 y=alt.Y('return_pct:Q', title='Return %'),
                 color=alt.Color('series:N', title='Series'),
+                xOffset=alt.XOffset('series:N'),
                 tooltip=[alt.Tooltip('year:O', title='Year'), alt.Tooltip('series:N', title='Series'), alt.Tooltip('return_pct:Q', title='Return %')]
-            ).properties(height=420)
+            )
+            # text labels on top of bars
+            text = alt.Chart(chart_df).mark_text(dy=-8, fontSize=12).encode(
+                x=alt.X('year:O'),
+                y=alt.Y('return_pct:Q'),
+                text=alt.Text('return_pct:Q', format='.2f'),
+                color=alt.condition(alt.datum.return_pct < 0, alt.value('white'), alt.value('black')),
+                xOffset=alt.XOffset('series:N')
+            )
+            chart = (bars + text).properties(height=420)
             st.altair_chart(chart, use_container_width=True)
         else:
             st.info("No yearly returns available to plot (all NaN).")
@@ -775,7 +790,7 @@ with tabs[1]:
             x=alt.X('date:T', title='Date'),
             y=alt.Y('cumulative_realized:Q', title='Cumulative Realized Profit (₹)'),
             tooltip=[alt.Tooltip('date:T', title='Date'), alt.Tooltip('cumulative_realized:Q', title='Cumulative Realized (₹)')]
-        ).properties(width='100%', height=300)
+        ).properties(height=300)  # removed width='100%' string that caused validation error
         st.altair_chart(chart, use_container_width=True)
 
         with st.expander("Show realized profit timeline table"):
