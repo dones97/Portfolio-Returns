@@ -550,4 +550,3 @@ with tabs[1]:
             st.info("No unrealized holdings.")
 
         st.markdown("---")
-        st.success("Finished computing returns. Use the styled expanders to see colored % views. XIRR uses the cashflow timing + current portfolio value, and is the recommended annualized metric here.")
