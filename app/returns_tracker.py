@@ -442,8 +442,8 @@ st.title("Portfolio Returns")
 st.markdown("""
 This page now adds:
 - A split next to total return showing realized vs unrealized contributions (INR and % of net invested).
-- A clustered column chart comparing portfolio returns vs Nifty-50 per calendar year (uses historical index prices; portfolio per-year uses Modified Dietz where possible; years with missing historical prices are shown as N/A).
-- An area chart showing cumulative realized profits over time (profits in INR vs time). This chart is based on realized sells (average-cost method) and is robust when historical prices for tickers are unavailable.
+- A clustered column chart comparing portfolio vs Nifty-50 per calendar year.
+- An area chart showing cumulative realized profits over time.
 """)
 
 tabs = st.tabs(["Trade Mapping", "Portfolio Returns"])
@@ -688,9 +688,7 @@ with tabs[1]:
         if port_ret_pct is not None:
             port_ret_pct = port_ret_pct * 100.0
         else:
-            # fallback: use realized_by_year / average capital approximation if net invested that year > 0
-            # Simple fallback: percent = realized_by_year / (avg portfolio value approximated as total buys in year)
-            simple_base = 0.0
+            # fallback: use realized_by_year / simple base if available
             mask_y = (history_df['date'].dt.year == y)
             buys_y = history_df[mask_y & history_df['side'].str.lower().str.startswith("buy")]
             buys_amt = (buys_y['quantity'].astype(float) * buys_y['price'].astype(float)).sum()
@@ -718,9 +716,8 @@ with tabs[1]:
         base = alt.Chart(chart_plot_df).mark_bar().encode(
             x=alt.X('year:O', title='Year'),
             y=alt.Y('return_pct:Q', title='Return %'),
-            color=alt.Color('series:N', title='Series'),
-            column=alt.Undefined()
-        ).properties(width=80, height=360)
+            color=alt.Color('series:N', title='Series')
+        ).properties(width=80 * len(years), height=360)
         st.altair_chart(base, use_container_width=True)
     else:
         st.info("Yearly comparison not available (insufficient data or missing historical prices).")
@@ -740,7 +737,6 @@ with tabs[1]:
     else:
         # build area chart with Altair
         realized_ts_sorted = realized_ts.sort_values("date").reset_index(drop=True)
-        # convert date to string for Altair ordinal/temporal x-axis
         chart = alt.Chart(realized_ts_sorted).mark_area(opacity=0.35).encode(
             x=alt.X('date:T', title='Date'),
             y=alt.Y('cumulative_realized:Q', title='Cumulative Realized Profit (₹)'),
