@@ -683,73 +683,81 @@ with tabs[1]:
     if not per_year_results:
         st.info("No per-year results could be computed from trade history.")
     else:
-        per_year_df = pd.DataFrame(per_year_results)
-        years_list = per_year_df["year"].astype(int).tolist()
-        nifty_map = compute_nifty_yearly_returns(years_list)
-        per_year_df["nifty_pct"] = per_year_df["year"].map(nifty_map)
+    per_year_df = pd.DataFrame(per_year_results)
 
-        # build chart data - two rows per year
-        chart_rows = []
-        for _, r in per_year_df.iterrows():
-            yr = int(r["year"])
-            port_val = r["return_pct"]
-            nifty_val = r["nifty_pct"]
-            if port_val is not None and not pd.isna(port_val):
-                chart_rows.append({"year": yr, "series": "Portfolio", "return_pct": float(port_val)})
-            if nifty_val is not None and not pd.isna(nifty_val):
-                chart_rows.append({"year": yr, "series": "Nifty 50 (^NSEI)", "return_pct": float(nifty_val)})
+    # Years we need to compare
+    years_list = per_year_df["year"].astype(int).tolist()
 
-        chart_df = pd.DataFrame(chart_rows)
-        if not chart_df.empty:
-            chart_df["label"] = chart_df["return_pct"].round(1).astype(str) + "%"
+    # Pull Nifty 50 (^NSEI) yearly returns over the same years (same index used for CAGR)
+    nifty_map = compute_nifty_yearly_returns(years_list)  # uses ^NSEI internally
+    per_year_df["nifty_pct"] = per_year_df["year"].map(nifty_map)
 
-            bars = alt.Chart(chart_df).mark_bar().encode(
-                x=alt.X("year:O", title="Year", sort=sorted(chart_df["year"].unique())),
-                y=alt.Y("return_pct:Q", title="Return %"),
-                color=alt.Color("series:N", title="Series"),
-                xOffset=alt.XOffset("series:N"),
-                tooltip=[alt.Tooltip("year:O", title="Year"),
-                         alt.Tooltip("series:N", title="Series"),
-                         alt.Tooltip("return_pct:Q", title="Return %", format=".2f")]
-            )
-            # labels above/below bars
-            text_pos = alt.Chart(chart_df[chart_df["return_pct"] >= 0]).mark_text(dy=-6, fontSize=11).encode(
-                x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
-                y=alt.Y("return_pct:Q"),
-                text=alt.Text("label:N"),
-                xOffset=alt.XOffset("series:N")
-            )
-            text_neg = alt.Chart(chart_df[chart_df["return_pct"] < 0]).mark_text(dy=12, fontSize=11).encode(
-                x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
-                y=alt.Y("return_pct:Q"),
-                text=alt.Text("label:N"),
-                xOffset=alt.XOffset("series:N")
-            )
-            chart = (bars + text_pos + text_neg).properties(height=420)
-            st.altair_chart(chart, use_container_width=True)
-        else:
-            st.info("No yearly returns available to plot.")
+    # Build chart data: two rows per year (Portfolio & Nifty)
+    chart_rows = []
+    for _, r in per_year_df.iterrows():
+        yr = int(r["year"])
+        port_val = r["return_pct"]
+        nifty_val = r["nifty_pct"]
+        if port_val is not None and not pd.isna(port_val):
+            chart_rows.append({"year": yr, "series": "Portfolio", "return_pct": float(port_val)})
+        if nifty_val is not None and not pd.isna(nifty_val):
+            chart_rows.append({"year": yr, "series": "Nifty 50 (^NSEI)", "return_pct": float(nifty_val)})
 
-        # calendar-year table (only the data rows)
-        display_rows = []
-        for _, r in per_year_df.iterrows():
-            display_rows.append({
-                "Year": int(r["year"]),
-                "BMV": inr_format(r["BMV"]),
-                "EMV": inr_format(r["EMV"]),
-                "Net Flows (₹)": inr_format(r["net_flows"]),
-                "Total Return (₹)": inr_format(r["total_return_amt"]),
-                "Return (%)": f"{round(r['return_pct'],2)}%" if r["return_pct"] is not None and not pd.isna(r["return_pct"]) else "N/A",
-                "Realized (₹)": inr_format(r["realized_amt"]),
-                "Unrealized (₹)": inr_format(r["unrealized_amt"]),
-                "Avg Portfolio Value (₹)": inr_format(r["avg_portfolio_val"]) if r["avg_portfolio_val"] else "N/A"
-            })
-        year_table_df = pd.DataFrame(display_rows)
-        st.dataframe(year_table_df)
+    chart_df = pd.DataFrame(chart_rows)
+    if not chart_df.empty:
+        chart_df["label"] = chart_df["return_pct"].round(1).astype(str) + "%"
 
-        if missing_prices:
-            st.warning("Used last trade price fallback when Yahoo historical prices were missing for some tickers/dates.")
-            st.write(sorted(list(set(missing_prices)))[:20])
+        bars = alt.Chart(chart_df).mark_bar().encode(
+            x=alt.X("year:O", title="Year", sort=sorted(chart_df["year"].unique())),
+            y=alt.Y("return_pct:Q", title="Return %"),
+            color=alt.Color("series:N", title="Series"),
+            xOffset=alt.XOffset("series:N"),
+            tooltip=[
+                alt.Tooltip("year:O", title="Year"),
+                alt.Tooltip("series:N", title="Series"),
+                alt.Tooltip("return_pct:Q", title="Return %", format=".2f"),
+            ],
+        )
+        # Place labels above/below bars
+        text_pos = alt.Chart(chart_df[chart_df["return_pct"] >= 0]).mark_text(dy=-6, fontSize=11).encode(
+            x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
+            y=alt.Y("return_pct:Q"),
+            text=alt.Text("label:N"),
+            xOffset=alt.XOffset("series:N"),
+        )
+        text_neg = alt.Chart(chart_df[chart_df["return_pct"] < 0]).mark_text(dy=12, fontSize=11).encode(
+            x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
+            y=alt.Y("return_pct:Q"),
+            text=alt.Text("label:N"),
+            xOffset=alt.XOffset("series:N"),
+        )
+
+        chart = (bars + text_pos + text_neg).properties(height=420)
+        st.altair_chart(chart, use_container_width=True)
+    else:
+        st.info("No yearly returns available to plot.")
+
+    # Optional: data table under the chart (unchanged logic)
+    display_rows = []
+    for _, r in per_year_df.iterrows():
+        display_rows.append({
+            "Year": int(r["year"]),
+            "BMV": inr_format(r["BMV"]),
+            "EMV": inr_format(r["EMV"]),
+            "Net Flows (₹)": inr_format(r["net_flows"]),
+            "Total Return (₹)": inr_format(r["total_return_amt"]),
+            "Return (%)": f"{round(r['return_pct'],2)}%" if r["return_pct"] is not None and not pd.isna(r["return_pct"]) else "N/A",
+            "Realized (₹)": inr_format(r["realized_amt"]),
+            "Unrealized (₹)": inr_format(r["unrealized_amt"]),
+            "Avg Portfolio Value (₹)": inr_format(r["avg_portfolio_val"]) if r["avg_portfolio_val"] else "N/A",
+        })
+    year_table_df = pd.DataFrame(display_rows)
+    st.dataframe(year_table_df)
+
+    if missing_prices:
+        st.warning("Used last trade price fallback when Yahoo historical prices were missing for some tickers/dates.")
+        st.write(sorted(list(set(missing_prices)))[:20])
+
 
     st.markdown("---")
 
