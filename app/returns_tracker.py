@@ -56,19 +56,10 @@ def map_ticker_for_row(row, user_mappings):
 def read_trade_report(file):
     df = pd.read_excel(file, dtype=str)
     colmap = {
-        "Scrip Code": "scrip_code",
-        "Scrip_Code": "scrip_code",
-        "scrip_code": "scrip_code",
-        "scrip code": "scrip_code",
-        "Company": "company_name",
-        "company_name": "company_name",
-        "company": "company_name",
-        "Quantity": "quantity",
-        "Price": "price",
-        "Side": "side",
-        "Buy/Sell": "side",
-        "Date": "date",
-        "date": "date"
+        "Scrip Code": "scrip_code", "Scrip_Code": "scrip_code", "scrip_code": "scrip_code", "scrip code": "scrip_code",
+        "Company": "company_name", "company_name": "company_name", "company": "company_name",
+        "Quantity": "quantity", "Price": "price", "Side": "side", "Buy/Sell": "side",
+        "Date": "date", "date": "date"
     }
     df = df.rename(columns={c: colmap[c] for c in df.columns if c in colmap})
     if 'scrip_code' in df.columns:
@@ -284,7 +275,7 @@ def compute_realized_pl_by_year(history_df):
                 pos[ticker]["cost"] = avg_cost * remaining_qty
     return realized_by_year
 
-# --- Fallback price resolution: Yahoo historical -> last trade price <= date in history_df ---
+# --- Fallback price: Yahoo historical -> last trade price in history_df ---
 
 def get_price_for_date_with_fallback(ticker, target_date, history_df):
     price = get_prev_trading_price(ticker, target_date)
@@ -328,11 +319,11 @@ def compute_yearly_metrics_from_trades(history_df):
             net[t] = buy_qty - sell_qty
         return net
 
+    today = pd.Timestamp(datetime.date.today())
+
     for y in years:
         start_dt = pd.Timestamp(datetime.date(y, 1, 1))
         end_dt = pd.Timestamp(datetime.date(y, 12, 31))
-        # Only compute up to today for current year
-        today = pd.Timestamp(datetime.date.today())
         end_dt_eff = min(end_dt, today)
 
         b_hold = holdings_as_of(start_dt, inclusive=False)
@@ -369,7 +360,7 @@ def compute_yearly_metrics_from_trades(history_df):
             else:
                 net_flows -= amt
 
-        # Skip completely empty years (no flows and zero BMV/EMV)
+        # Skip empty years
         if abs(net_flows) < 1e-9 and abs(BMV) < 1e-9 and abs(EMV) < 1e-9:
             continue
 
@@ -400,46 +391,46 @@ def compute_yearly_metrics_from_trades(history_df):
 
     return results, missing_prices
 
-# --- Yearly Nifty returns (per calendar year, robust) ---
-@lru_cache(maxsize=128)
-def nifty_year_return(year):
-    start_dt = pd.Timestamp(datetime.date(year, 1, 1))
-    end_dt = pd.Timestamp(datetime.date(year, 12, 31))
-    today = pd.Timestamp(datetime.date.today())
-    end_eff = min(end_dt, today)
-    if end_eff < start_dt:
-        return None
+# --- Nifty yearly returns for a set of years (single fetch, robust) ---
+
+def compute_nifty_yearly_returns(years):
+    if not years:
+        return {}
+    min_year = min(years)
+    max_year = max(years)
+    start_all = pd.Timestamp(datetime.date(min_year, 1, 1)) - pd.Timedelta(days=60)
+    end_all = min(pd.Timestamp(datetime.date(max_year, 12, 31)), pd.Timestamp(datetime.date.today()))
     try:
-        ticker = "^NSEI"
-        hist = yf.Ticker(ticker).history(
-            start=(start_dt - pd.Timedelta(days=40)).strftime("%Y-%m-%d"),
-            end=(end_eff + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-        )
+        hist = yf.Ticker("^NSEI").history(start=start_all.strftime("%Y-%m-%d"),
+                                          end=(end_all + pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
         if hist is None or hist.empty:
-            return None
-        start_series = hist[hist.index <= start_dt]
-        end_series = hist[hist.index <= end_eff]
-        if end_series.empty:
-            return None
-        # Use last close on/before the dates
-        start_val = (start_series["Close"].iloc[-1]
-                     if not start_series.empty else hist["Close"].iloc[0])
-        end_val = end_series["Close"].iloc[-1]
-        if start_val == 0:
-            return None
-        return (end_val / start_val - 1.0) * 100.0
+            return {}
+        out = {}
+        for y in years:
+            ys = pd.Timestamp(datetime.date(y, 1, 1))
+            ye = min(pd.Timestamp(datetime.date(y, 12, 31)), end_all)
+            if ye < ys:
+                continue
+            s_series = hist[hist.index <= ys]
+            e_series = hist[hist.index <= ye]
+            if e_series.empty:
+                continue
+            start_val = s_series["Close"].iloc[-1] if not s_series.empty else hist["Close"].iloc[0]
+            end_val = e_series["Close"].iloc[-1]
+            if start_val and start_val != 0:
+                out[y] = (end_val / start_val - 1.0) * 100.0
+        return out
     except Exception:
-        return None
+        return {}
 
 # --- Profit over time (cumulative total P&L = realized + unrealized estimate using last trade prices) ---
 
 def pnl_over_time(history_df):
     """
-    Build a time series at trade dates:
+    Time series at trade dates:
     - Realized P&L accumulates on sells using average cost.
-    - Unrealized P&L at each date is sum over tickers of qty * (last_trade_price - avg_cost_per_share).
-      last_trade_price uses the most recent trade price for that ticker up to the date (no Yahoo dependency).
-    Returns DataFrame: date, realized_cum, unrealized_est, total_pnl
+    - Unrealized estimate at each date uses last trade price per ticker vs avg cost (no Yahoo dependency).
+    Returns: date, realized_cum, unrealized_est, total_pnl
     """
     df = history_df.copy().sort_values("date")
     pos = {}  # ticker -> dict(qty, cost_sum, last_price)
@@ -459,16 +450,13 @@ def pnl_over_time(history_df):
             pos[t] = {"qty": 0.0, "cost": 0.0, "last_price": None}
 
         if side == "buy":
-            # update avg cost
             pos[t]["qty"] += qty
             pos[t]["cost"] += qty * price
             pos[t]["last_price"] = price
         else:
-            # sell at price, realized profit against avg cost BEFORE reducing qty
             avg_cost = (pos[t]["cost"] / pos[t]["qty"]) if pos[t]["qty"] > 0 else 0.0
             realized = qty * (price - avg_cost)
             realized_cum += realized
-            # reduce position proportionally
             remaining_qty = pos[t]["qty"] - qty
             if remaining_qty <= 0:
                 pos[t]["qty"] = 0.0
@@ -476,14 +464,13 @@ def pnl_over_time(history_df):
             else:
                 pos[t]["qty"] = remaining_qty
                 pos[t]["cost"] = avg_cost * remaining_qty
-            pos[t]["last_price"] = price  # last trade price seen
+            pos[t]["last_price"] = price
 
-        # compute unrealized estimate at this date
         unrealized = 0.0
         for k, p in pos.items():
             if p["qty"] > 0 and p["last_price"] is not None:
-                avg_cost_k = (p["cost"] / p["qty"]) if p["qty"] > 0 else 0.0
-                unrealized += p["qty"] * (p["last_price"] - avg_cost_k)
+                avg_c = (p["cost"] / p["qty"]) if p["qty"] > 0 else 0.0
+                unrealized += p["qty"] * (p["last_price"] - avg_c)
 
         total = realized_cum + unrealized
         rows.append({"date": dt, "realized_cum": realized_cum, "unrealized_est": unrealized, "total_pnl": total})
@@ -492,7 +479,6 @@ def pnl_over_time(history_df):
         return pd.DataFrame(columns=["date", "realized_cum", "unrealized_est", "total_pnl"])
 
     out = pd.DataFrame(rows)
-    # Aggregate by date (if multiple trades per date)
     out = out.groupby("date", as_index=False).agg(
         realized_cum=("realized_cum", "max"),
         unrealized_est=("unrealized_est", "last"),
@@ -721,14 +707,15 @@ with tabs[1]:
     st.subheader("Portfolio vs Nifty 50: Yearly Comparison (calendar years)")
 
     per_year_results, missing_prices = compute_yearly_metrics_from_trades(history_df)
-
     if not per_year_results:
         st.info("No per-year results could be computed from trade history.")
     else:
         per_year_df = pd.DataFrame(per_year_results)
-        per_year_df['nifty_pct'] = per_year_df['year'].apply(lambda y: nifty_year_return(y))
+        years_list = per_year_df["year"].astype(int).tolist()
+        nifty_year_map = compute_nifty_yearly_returns(years_list)
+        per_year_df["nifty_pct"] = per_year_df["year"].map(nifty_year_map)
 
-        # Build chart data, keep only rows where at least one series has a value
+        # Keep only years that have at least one series value
         chart_rows = []
         for _, r in per_year_df.iterrows():
             port_pct = r['return_pct'] if (r['return_pct'] is not None and not pd.isna(r['return_pct'])) else np.nan
@@ -736,9 +723,11 @@ with tabs[1]:
             if not (np.isnan(port_pct) and np.isnan(nifty_pct)):
                 chart_rows.append({"year": int(r['year']), "series": "Portfolio", "return_pct": port_pct})
                 chart_rows.append({"year": int(r['year']), "series": "Nifty 50", "return_pct": nifty_pct})
+
         chart_df = pd.DataFrame(chart_rows).dropna(subset=['return_pct'])
         if not chart_df.empty:
             chart_df["label"] = chart_df["return_pct"].round(1).astype(str) + "%"
+
             bars = alt.Chart(chart_df).mark_bar().encode(
                 x=alt.X('year:O', title='Year', sort=sorted(chart_df["year"].unique())),
                 y=alt.Y('return_pct:Q', title='Return %'),
@@ -748,14 +737,13 @@ with tabs[1]:
                          alt.Tooltip('series:N', title='Series'),
                          alt.Tooltip('return_pct:Q', title='Return %', format='.2f')]
             )
-            # Positive labels
+            # Labels (above for positive, below for negative)
             text_pos = alt.Chart(chart_df[chart_df["return_pct"] >= 0]).mark_text(dy=-6, fontSize=11).encode(
                 x=alt.X('year:O', sort=sorted(chart_df["year"].unique())),
                 y=alt.Y('return_pct:Q'),
                 text=alt.Text('label:N'),
                 xOffset=alt.XOffset('series:N')
             )
-            # Negative labels (place below bar)
             text_neg = alt.Chart(chart_df[chart_df["return_pct"] < 0]).mark_text(dy=12, fontSize=11).encode(
                 x=alt.X('year:O', sort=sorted(chart_df["year"].unique())),
                 y=alt.Y('return_pct:Q'),
@@ -771,7 +759,7 @@ with tabs[1]:
             st.warning("Some tickers were missing Yahoo historical prices; we used the last trade price from your history as a fallback for those dates. Examples (ticker, date):")
             st.write(sorted(list(set(missing_prices)))[:20])
 
-        # Calendar year table (only data rows; no fixed height)
+        # Calendar year table (only data rows)
         display_rows = []
         for _, r in per_year_df.iterrows():
             display_rows.append({
@@ -797,7 +785,6 @@ with tabs[1]:
     if pnl_ts.empty:
         st.info("No trades found to build profit timeline.")
     else:
-        # Area for total P&L; overlay line for realized cumulative
         base = alt.Chart(pnl_ts).encode(x=alt.X('date:T', title='Date'))
         area_total = base.mark_area(opacity=0.4, color='#1f77b4').encode(
             y=alt.Y('total_pnl:Q', title='Cumulative Profit (₹)'),
