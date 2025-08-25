@@ -565,6 +565,10 @@ with tabs[1]:
         st.stop()
 
     history_df = pd.read_csv(PORTFOLIO_HISTORY_CSV)
+    
+    # Handle case-insensitive column names
+    history_df.columns = history_df.columns.str.lower()
+    
     if "date" not in history_df.columns:
         st.error("portfolio_history.csv missing 'date' column.")
         st.stop()
@@ -737,7 +741,7 @@ with tabs[1]:
         else:
             st.info("No yearly returns available to plot.")
     
-        # Optional: data table under the chart (unchanged logic)
+        # Optional: data table under the chart (updated to include Nifty 50 returns)
         display_rows = []
         for _, r in per_year_df.iterrows():
             display_rows.append({
@@ -746,7 +750,8 @@ with tabs[1]:
                 "EMV": inr_format(r["EMV"]),
                 "Net Flows (₹)": inr_format(r["net_flows"]),
                 "Total Return (₹)": inr_format(r["total_return_amt"]),
-                "Return (%)": f"{round(r['return_pct'],2)}%" if r["return_pct"] is not None and not pd.isna(r["return_pct"]) else "N/A",
+                "Portfolio Return (%)": f"{round(r['return_pct'],2)}%" if r["return_pct"] is not None and not pd.isna(r["return_pct"]) else "N/A",
+                "Nifty 50 Return (%)": f"{round(r['nifty_pct'],2)}%" if r["nifty_pct"] is not None and not pd.isna(r["nifty_pct"]) else "N/A",
                 "Realized (₹)": inr_format(r["realized_amt"]),
                 "Unrealized (₹)": inr_format(r["unrealized_amt"]),
                 "Avg Portfolio Value (₹)": inr_format(r["avg_portfolio_val"]) if r["avg_portfolio_val"] else "N/A",
