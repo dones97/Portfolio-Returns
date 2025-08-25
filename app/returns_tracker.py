@@ -85,7 +85,7 @@ def get_repository_trade_reports():
             st.warning(f"Could not read {file}: {e}")
     return reports
 
-# --- FORMATTING ---
+# --- INR formatting ---
 
 def inr_format(amount):
     try:
@@ -127,7 +127,6 @@ def get_prev_trading_price(ticker, target_date):
     key = ("hist", ticker, target_day.strftime("%Y-%m-%d"))
     if key in _price_cache:
         return _price_cache[key]
-    # wider window for safety
     start = (target_day - pd.Timedelta(days=40)).strftime("%Y-%m-%d")
     end = (target_day + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     try:
@@ -164,30 +163,46 @@ def get_current_price(ticker):
         _price_cache[key] = None
         return None
 
-# --- REALIZED / UNREALIZED (average-cost) ---
+# --- REALIZED / UNREALIZED (FIFO) ---
 
-def calc_realized_unrealized_avgcost(df):
+def calc_realized_unrealized_fifo(df):
     result_realized = []
     result_unrealized = []
 
     for ticker, trades in df.groupby("yahoo_ticker"):
         trades = trades.sort_values("date")
-        buys = trades[trades["side"].str.lower() == "buy"].copy()
-        sells = trades[trades["side"].str.lower() == "sell"].copy()
+        fifo_lots = []  # [qty_remaining, price]
+        realized_pl = 0.0
+        realized_qty = 0
+        total_realized_buy_amt = 0.0
+        total_realized_sell_amt = 0.0
 
-        total_buy_qty = buys["quantity"].astype(float).sum()
-        total_buy_amt = (buys["quantity"].astype(float) * buys["price"].astype(float)).sum()
-        avg_buy_price = total_buy_amt / total_buy_qty if total_buy_qty else 0
+        for _, row in trades.iterrows():
+            qty = float(row["quantity"])
+            price = float(row["price"])
+            side = str(row["side"]).lower()
+            if side == "buy":
+                fifo_lots.append([qty, price])
+            else:  # sell
+                sell_qty = qty
+                total_sell_amt = qty * price
+                while sell_qty > 0 and fifo_lots:
+                    lot_qty, lot_price = fifo_lots[0]
+                    match_qty = min(lot_qty, sell_qty)
+                    realized_pl += match_qty * (price - lot_price)
+                    realized_qty += match_qty
+                    total_realized_buy_amt += match_qty * lot_price
+                    total_realized_sell_amt += match_qty * price
+                    lot_qty -= match_qty
+                    sell_qty -= match_qty
+                    if lot_qty == 0:
+                        fifo_lots.pop(0)
+                    else:
+                        fifo_lots[0][0] = lot_qty
 
-        total_sell_qty = sells["quantity"].astype(float).sum()
-        total_sell_amt = (sells["quantity"].astype(float) * sells["price"].astype(float)).sum()
-        avg_sell_price = total_sell_amt / total_sell_qty if total_sell_qty else 0
-
-        realized_qty = min(total_sell_qty, total_buy_qty)
-        realized_buy_amt = realized_qty * avg_buy_price
-        realized_sell_amt = realized_qty * avg_sell_price
-        realized_pl_value = realized_sell_amt - realized_buy_amt
-        realized_pl_pct = ((avg_sell_price - avg_buy_price) / avg_buy_price * 100) if avg_buy_price else 0
+        avg_buy_price = (total_realized_buy_amt / realized_qty) if realized_qty else 0
+        avg_sell_price = (total_realized_sell_amt / realized_qty) if realized_qty else 0
+        realized_pl_pct = ((avg_sell_price - avg_buy_price) / avg_buy_price * 100) if avg_buy_price else None
 
         if realized_qty > 0:
             result_realized.append({
@@ -195,21 +210,22 @@ def calc_realized_unrealized_avgcost(df):
                 "Quantity": int(realized_qty),
                 "Average Buy Price": round(avg_buy_price, 2),
                 "Average Sell Price": round(avg_sell_price, 2),
-                "Profit/Loss Value": realized_pl_value,
+                "Profit/Loss Value": realized_pl,
                 "Profit/Loss %": realized_pl_pct
             })
 
-        unrealized_qty = total_buy_qty - total_sell_qty
+        unrealized_qty = int(sum(lot[0] for lot in fifo_lots))
         if unrealized_qty > 0:
             current_price = get_current_price(ticker)
-            unrealized_buy_amt = unrealized_qty * avg_buy_price
-            unrealized_curr_amt = unrealized_qty * current_price if current_price is not None else None
-            unrealized_pl_value = (unrealized_curr_amt - unrealized_buy_amt) if current_price is not None else None
-            unrealized_pl_pct = ((current_price - avg_buy_price) / avg_buy_price * 100) if (current_price is not None and avg_buy_price) else None
+            total_unrealized_buy_amt = sum(lot[0] * lot[1] for lot in fifo_lots)
+            total_unrealized_curr_amt = sum(lot[0] * current_price for lot in fifo_lots) if current_price is not None else None
+            unrealized_pl_value = (total_unrealized_curr_amt - total_unrealized_buy_amt) if current_price is not None else None
+            avg_unrealized_buy_price = (total_unrealized_buy_amt / unrealized_qty) if unrealized_qty else 0
+            unrealized_pl_pct = ((current_price - avg_unrealized_buy_price) / avg_unrealized_buy_price * 100) if (current_price is not None and avg_unrealized_buy_price) else None
             result_unrealized.append({
                 "Ticker": ticker,
                 "Quantity": int(unrealized_qty),
-                "Average Buy Price": round(avg_buy_price, 2),
+                "Average Buy Price": round(avg_unrealized_buy_price, 2),
                 "Current Price": round(current_price, 2) if current_price is not None else "N/A",
                 "Profit/Loss Value": unrealized_pl_value if unrealized_pl_value is not None else "N/A",
                 "Profit/Loss %": unrealized_pl_pct if unrealized_pl_pct is not None else "N/A"
@@ -237,12 +253,14 @@ def build_cashflows_from_history(history_df):
             cfs.append((amt, dt))   # inflow on sell
     return cfs
 
-# --- Realized by year (avg-cost sim) ---
+# --- Realized by year (FIFO sim) ---
 
-def compute_realized_pl_by_year(history_df):
+def compute_realized_pl_by_year_fifo(history_df):
     df = history_df.copy().sort_values("date")
     realized_by_year = {}
     pos = {}
+    lots = {}
+
     for _, r in df.iterrows():
         ticker = r.get("yahoo_ticker", "")
         if not ticker or pd.isna(ticker):
@@ -251,22 +269,23 @@ def compute_realized_pl_by_year(history_df):
         qty = float(r["quantity"])
         price = float(r["price"])
         year = pd.to_datetime(r["date"]).year
-        if ticker not in pos:
-            pos[ticker] = {"qty": 0.0, "cost": 0.0}
+        if ticker not in lots:
+            lots[ticker] = []
         if side == "buy":
-            pos[ticker]["qty"] += qty
-            pos[ticker]["cost"] += qty * price
+            lots[ticker].append([qty, price])
         else:
-            avg_cost = (pos[ticker]["cost"] / pos[ticker]["qty"]) if pos[ticker]["qty"] > 0 else 0.0
-            realized = qty * (price - avg_cost)
-            realized_by_year[year] = realized_by_year.get(year, 0.0) + realized
-            remaining_qty = pos[ticker]["qty"] - qty
-            if remaining_qty <= 0:
-                pos[ticker]["qty"] = 0.0
-                pos[ticker]["cost"] = 0.0
-            else:
-                pos[ticker]["qty"] = remaining_qty
-                pos[ticker]["cost"] = avg_cost * remaining_qty
+            sell_qty = qty
+            while sell_qty > 0 and lots[ticker]:
+                lot_qty, lot_price = lots[ticker][0]
+                match_qty = min(lot_qty, sell_qty)
+                realized = match_qty * (price - lot_price)
+                realized_by_year[year] = realized_by_year.get(year, 0.0) + realized
+                lot_qty -= match_qty
+                sell_qty -= match_qty
+                if lot_qty == 0:
+                    lots[ticker].pop(0)
+                else:
+                    lots[ticker][0][0] = lot_qty
     return realized_by_year
 
 # --- Fallback price on a date: Yahoo -> last trade price ---
@@ -285,7 +304,7 @@ def get_price_for_date_with_fallback(ticker, target_date, history_df):
 
 # --- Calendar-year metrics from trades (robust) ---
 
-def compute_yearly_metrics_from_trades(history_df):
+def compute_yearly_metrics_from_trades_fifo(history_df):
     if history_df.empty:
         return [], []
 
@@ -295,7 +314,7 @@ def compute_yearly_metrics_from_trades(history_df):
     last_year = history_df["date"].dt.year.max()
     years = list(range(first_year, last_year + 1))
 
-    realized_by_year = compute_realized_pl_by_year(history_df)
+    realized_by_year = compute_realized_pl_by_year_fifo(history_df)
     missing_prices = []
     results = []
     today = pd.Timestamp(datetime.date.today())
@@ -306,41 +325,57 @@ def compute_yearly_metrics_from_trades(history_df):
         else:
             mask = history_df["date"] < pd.to_datetime(dt)
         sub = history_df.loc[mask].dropna(subset=["yahoo_ticker"])
-        net = {}
+        lots = {}
         for t, grp in sub.groupby("yahoo_ticker"):
-            buy_qty = grp[grp["side"].str.lower() == "buy"]["quantity"].astype(float).sum()
-            sell_qty = grp[grp["side"].str.lower() == "sell"]["quantity"].astype(float).sum()
-            net[t] = buy_qty - sell_qty
-        return net
+            lots[t] = []
+            for _, r in grp.iterrows():
+                qty = float(r["quantity"])
+                price = float(r["price"])
+                side = str(r["side"]).lower()
+                if side == "buy":
+                    lots[t].append([qty, price])
+                else:
+                    sell_qty = qty
+                    while sell_qty > 0 and lots[t]:
+                        lot_qty, lot_price = lots[t][0]
+                        match_qty = min(lot_qty, sell_qty)
+                        lot_qty -= match_qty
+                        sell_qty -= match_qty
+                        if lot_qty == 0:
+                            lots[t].pop(0)
+                        else:
+                            lots[t][0][0] = lot_qty
+        net = {}
+        for t, lotlist in lots.items():
+            net[t] = sum(lot[0] for lot in lotlist)
+        return lots, net
 
     for y in years:
         start_dt = pd.Timestamp(datetime.date(y, 1, 1))
         end_dt = pd.Timestamp(datetime.date(y, 12, 31))
         end_eff = min(end_dt, today)
 
-        b_hold = holdings_as_of(start_dt, inclusive=False)
-        e_hold = holdings_as_of(end_eff, inclusive=True)
+        b_lots, b_hold = holdings_as_of(start_dt, inclusive=False)
+        e_lots, e_hold = holdings_as_of(end_eff, inclusive=True)
 
         BMV = 0.0
         EMV = 0.0
 
-        for t, qty in b_hold.items():
-            if qty == 0:
-                continue
-            price, _ = get_price_for_date_with_fallback(t, start_dt, history_df)
-            if price is None:
-                missing_prices.append((t, start_dt.date()))
-                continue
-            BMV += qty * price
+        for t, lots in b_lots.items():
+            for qty, price in lots:
+                price_val, _ = get_price_for_date_with_fallback(t, start_dt, history_df)
+                if price_val is None:
+                    missing_prices.append((t, start_dt.date()))
+                    continue
+                BMV += qty * price_val
 
-        for t, qty in e_hold.items():
-            if qty == 0:
-                continue
-            price, _ = get_price_for_date_with_fallback(t, end_eff, history_df)
-            if price is None:
-                missing_prices.append((t, end_eff.date()))
-                continue
-            EMV += qty * price
+        for t, lots in e_lots.items():
+            for qty, price in lots:
+                price_val, _ = get_price_for_date_with_fallback(t, end_eff, history_df)
+                if price_val is None:
+                    missing_prices.append((t, end_eff.date()))
+                    continue
+                EMV += qty * price_val
 
         mask_year = (history_df["date"] >= start_dt) & (history_df["date"] <= end_eff)
         df_year = history_df.loc[mask_year]
@@ -382,7 +417,7 @@ def compute_yearly_metrics_from_trades(history_df):
 
     return results, missing_prices
 
-# --- Nifty 50 yearly returns for given years (single fetch; same index as headline: ^NSEI) ---
+# --- Nifty 50 yearly returns (robust, tz-naive, first trade logic) ---
 
 def compute_nifty_yearly_returns(years, first_trade=None):
     today = pd.Timestamp(datetime.date.today())
@@ -394,7 +429,6 @@ def compute_nifty_yearly_returns(years, first_trade=None):
     if hist is None or hist.empty:
         return {}
     closes = hist["Close"]
-    # Make closes index timezone-naive
     closes.index = closes.index.tz_localize(None)
     out = {}
     for i, year in enumerate(sorted(years)):
@@ -407,7 +441,6 @@ def compute_nifty_yearly_returns(years, first_trade=None):
             end_dt = today.tz_localize(None)
         else:
             end_dt = pd.Timestamp(datetime.date(year, 12, 31)).tz_localize(None)
-        # Get last close on or before start
         start_prices = closes[closes.index <= start_dt]
         end_prices = closes[closes.index <= end_dt]
         if not start_prices.empty and not end_prices.empty:
@@ -417,12 +450,12 @@ def compute_nifty_yearly_returns(years, first_trade=None):
         else:
             out[year] = None
     return out
-    
-# --- P&L timeline (cumulative total = realized + unrealized estimate using last trade prices) ---
 
-def pnl_over_time(history_df):
+# --- P&L time series (cumulative realized + unrealized FIFO) ---
+
+def pnl_over_time_fifo(history_df):
     df = history_df.copy().sort_values("date")
-    pos = {}  # ticker -> dict(qty, cost_sum, last_price)
+    pos = {}  # ticker -> queue of lots
     realized_cum = 0.0
     rows = []
 
@@ -436,30 +469,28 @@ def pnl_over_time(history_df):
         dt = pd.to_datetime(r["date"])
 
         if t not in pos:
-            pos[t] = {"qty": 0.0, "cost": 0.0, "last_price": None}
-
+            pos[t] = []
         if side == "buy":
-            pos[t]["qty"] += qty
-            pos[t]["cost"] += qty * price
-            pos[t]["last_price"] = price
+            pos[t].append([qty, price])
         else:
-            avg_cost = (pos[t]["cost"] / pos[t]["qty"]) if pos[t]["qty"] > 0 else 0.0
-            realized = qty * (price - avg_cost)
-            realized_cum += realized
-            remaining_qty = pos[t]["qty"] - qty
-            if remaining_qty <= 0:
-                pos[t]["qty"] = 0.0
-                pos[t]["cost"] = 0.0
-            else:
-                pos[t]["qty"] = remaining_qty
-                pos[t]["cost"] = avg_cost * remaining_qty
-            pos[t]["last_price"] = price
+            sell_qty = qty
+            while sell_qty > 0 and pos[t]:
+                lot_qty, lot_price = pos[t][0]
+                match_qty = min(lot_qty, sell_qty)
+                realized_cum += match_qty * (price - lot_price)
+                lot_qty -= match_qty
+                sell_qty -= match_qty
+                if lot_qty == 0:
+                    pos[t].pop(0)
+                else:
+                    pos[t][0][0] = lot_qty
 
+        # Unrealized
         unrealized = 0.0
-        for k, p in pos.items():
-            if p["qty"] > 0 and p["last_price"] is not None:
-                avg_c = (p["cost"] / p["qty"]) if p["qty"] > 0 else 0.0
-                unrealized += p["qty"] * (p["last_price"] - avg_c)
+        for lots in pos.values():
+            for lot_qty, lot_price in lots:
+                last_price = price  # Use last trade price as estimate
+                unrealized += lot_qty * (last_price - lot_price)
 
         total = realized_cum + unrealized
         rows.append({"date": dt, "realized_cum": realized_cum, "unrealized_est": unrealized, "total_pnl": total})
@@ -478,7 +509,7 @@ def pnl_over_time(history_df):
 # --- STREAMLIT UI ---
 
 st.set_page_config(page_title="Portfolio Returns Tracker", layout="wide")
-st.title("Portfolio Returns")
+st.title("Portfolio Returns (FIFO)")
 
 tabs = st.tabs(["Trade Mapping", "Portfolio Returns"])
 
@@ -559,7 +590,7 @@ with tabs[0]:
     st.dataframe(mapping_df)
 
 with tabs[1]:
-    st.header("Portfolio Returns")
+    st.header("Portfolio Returns (FIFO)")
 
     if not os.path.exists(PORTFOLIO_HISTORY_CSV):
         st.warning("No portfolio_history.csv found. Save mapped trades first.")
@@ -576,7 +607,7 @@ with tabs[1]:
         st.stop()
 
     # Headline metrics
-    realized_df, unrealized_df, total_realized, total_unrealized = calc_realized_unrealized_avgcost(history_df)
+    realized_df, unrealized_df, total_realized, total_unrealized = calc_realized_unrealized_fifo(history_df)
 
     curr_value = unrealized_df.apply(
         lambda row: float(row["Quantity"]) * (float(row["Current Price"]) if row["Current Price"] != "N/A" else 0), axis=1
@@ -596,6 +627,7 @@ with tabs[1]:
     # XIRR
     cashflows = build_cashflows_from_history(history_df)
     irr_str = "<span style='color:gray;'>N/A</span>"
+    irr_val = None
     if cashflows:
         amounts = [amt for amt, _ in cashflows]
         dates = [dt for _, dt in cashflows]
@@ -603,30 +635,13 @@ with tabs[1]:
         amounts.append(curr_value)
         dates.append(today)
         try:
-            try:
-                import numpy_financial as npf
-                irr_val = npf.xirr(amounts, dates) * 100.0
-            except Exception:
-                # simple Newton fallback
-                d0 = pd.to_datetime(dates[0])
-                times = np.array([(pd.to_datetime(d) - d0).days / 365.0 for d in dates], dtype=float)
-                amts = np.array(amounts, dtype=float)
-                def f(r): return np.sum(amts / ((1.0 + r) ** times))
-                def fp(r): return np.sum(-amts * times / ((1.0 + r) ** (times + 1.0)))
-                r = 0.1
-                for _ in range(200):
-                    val = f(r); der = fp(r)
-                    if der == 0: break
-                    step = val / der
-                    r -= step
-                    if abs(step) < 1e-6: 
-                        irr_val = r * 100.0
-                        break
-            irr_str = color_pct_html(irr_val) if 'irr_val' in locals() and irr_val is not None else irr_str
+            import numpy_financial as npf
+            irr_val = npf.xirr(amounts, dates) * 100.0
+            irr_str = color_pct_html(irr_val) if irr_val is not None else irr_str
         except Exception:
+            irr_val = None
             irr_str = "<span style='color:gray;'>N/A</span>"
 
-    # Nifty 50 CAGR headline (same index we'll use for yearly)
     first_trade = history_df["date"].min()
     last_trade = history_df["date"].max()
     nifty_cagr_val = None
@@ -677,31 +692,27 @@ with tabs[1]:
 
     st.markdown("---")
 
-     # --- Calendar-year comparison: grouped bars (Portfolio vs Nifty 50) ---
+    # --- Calendar-year comparison: grouped bars (Portfolio vs Nifty 50) ---
     st.subheader("Portfolio vs Nifty 50: Yearly Comparison (calendar years)")
 
-    per_year_results, missing_prices = compute_yearly_metrics_from_trades(history_df)
+    per_year_results, missing_prices = compute_yearly_metrics_from_trades_fifo(history_df)
     if not per_year_results:
         st.info("No per-year results could be computed from trade history.")
     else:
         per_year_df = pd.DataFrame(per_year_results)
-
-        # Years we need to compare
         years_list = per_year_df["year"].astype(int).tolist()
         nifty_map = compute_nifty_yearly_returns(years_list, first_trade=history_df["date"].min())
-        
-        # Always build chart data for all years (show both, even if portfolio return is missing)
+        per_year_df["nifty_pct"] = per_year_df["year"].map(nifty_map)
+
         chart_rows = []
         for yr in years_list:
             port_row = per_year_df[per_year_df["year"] == yr]
             port_val = port_row.iloc[0]["return_pct"] if not port_row.empty else None
             nifty_val = nifty_map.get(yr, None)
-            # Portfolio bar
             chart_rows.append({
                 "year": yr, "series": "Portfolio",
                 "return_pct": float(port_val) if port_val is not None and not pd.isna(port_val) else np.nan
             })
-            # Nifty bar
             chart_rows.append({
                 "year": yr, "series": "Nifty 50 (^NSEI)",
                 "return_pct": float(nifty_val) if nifty_val is not None and not pd.isna(nifty_val) else np.nan
@@ -724,7 +735,6 @@ with tabs[1]:
                     alt.Tooltip("return_pct:Q", title="Return %", format=".2f"),
                 ],
             )
-            # Place labels above/below bars
             text_pos = alt.Chart(chart_df[chart_df["return_pct"] >= 0]).mark_text(dy=-6, fontSize=11).encode(
                 x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
                 y=alt.Y("return_pct:Q"),
@@ -743,7 +753,6 @@ with tabs[1]:
         else:
             st.info("No yearly returns available to plot.")
 
-        # Data table under the chart: includes both Portfolio and Nifty returns for each year
         display_rows = []
         for yr in years_list:
             port_row = per_year_df[per_year_df["year"] == yr]
@@ -767,17 +776,15 @@ with tabs[1]:
             st.warning("Used last trade price fallback when Yahoo historical prices were missing for some tickers/dates.")
             st.write(sorted(list(set(missing_prices)))[:20])
 
-
     st.markdown("---")
 
     # --- Cumulative portfolio profit over time (Total = realized + unrealized estimate) ---
     st.subheader("Cumulative Portfolio Profit Over Time (INR)")
 
-    pnl_ts = pnl_over_time(history_df)
+    pnl_ts = pnl_over_time_fifo(history_df)
     if pnl_ts.empty:
         st.info("No trades found to build profit timeline.")
     else:
-        # Axis that shows Indian units (K/L/Cr)
         axis_indian = alt.Axis(
             title="Cumulative Profit (₹)",
             labelExpr=(
@@ -786,8 +793,6 @@ with tabs[1]:
                 "datum.value >= 1e3 ? format(datum.value/1e3, ',.0f') + ' K' : format(datum.value, ',')"
             )
         )
-
-        # Fold to show legend (Total as area, Realized as line)
         fold_df = pnl_ts.melt(id_vars=["date"], value_vars=["total_pnl", "realized_cum"],
                               var_name="series", value_name="value")
 
@@ -822,8 +827,8 @@ with tabs[1]:
 
     st.markdown("---")
 
-    # --- Realized / Unrealized tables (no styled variants) ---
-    st.subheader("Realized Returns (Average Costing)")
+    # --- Realized / Unrealized tables (FIFO, no styled variants) ---
+    st.subheader("Realized Returns (FIFO)")
     if not realized_df.empty:
         rf = realized_df.copy()
         rf["Profit/Loss Value INR"] = rf["Profit/Loss Value"].apply(inr_format)
@@ -837,13 +842,12 @@ with tabs[1]:
     else:
         st.info("No realized trades or profit/loss yet.")
 
-    st.subheader("Unrealized Returns (Average Costing)")
+    st.subheader("Unrealized Returns (FIFO)")
     if not unrealized_df.empty:
         uf = unrealized_df.copy()
         uf["Profit/Loss Value INR"] = uf["Profit/Loss Value"].apply(lambda x: inr_format(x) if x != "N/A" else "N/A")
         uf["Average Buy Price INR"] = uf["Average Buy Price"].apply(inr_format)
         uf["Current Price INR"] = uf["Current Price"].apply(lambda x: inr_format(x) if x != "N/A" else "N/A")
-        # numeric for sorting
         def to_num(x):
             try:
                 return float(x)
