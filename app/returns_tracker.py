@@ -676,7 +676,7 @@ with tabs[1]:
 
     st.markdown("---")
 
-    # --- Calendar-year comparison: grouped bars (Portfolio vs Nifty 50) ---
+     # --- Calendar-year comparison: grouped bars (Portfolio vs Nifty 50) ---
     st.subheader("Portfolio vs Nifty 50: Yearly Comparison (calendar years)")
 
     per_year_results, missing_prices = compute_yearly_metrics_from_trades(history_df)
@@ -687,26 +687,31 @@ with tabs[1]:
 
         # Years we need to compare
         years_list = per_year_df["year"].astype(int).tolist()
-    
-        # Pull Nifty 50 (^NSEI) yearly returns over the same years (same index used for CAGR)
         nifty_map = compute_nifty_yearly_returns(years_list)  # uses ^NSEI internally
-        per_year_df["nifty_pct"] = per_year_df["year"].map(nifty_map)
-    
-        # Build chart data: two rows per year (Portfolio & Nifty)
+
+        # Always build chart data for all years (show both, even if portfolio return is missing)
         chart_rows = []
-        for _, r in per_year_df.iterrows():
-            yr = int(r["year"])
-            port_val = r["return_pct"]
-            nifty_val = r["nifty_pct"]
-            if port_val is not None and not pd.isna(port_val):
-                chart_rows.append({"year": yr, "series": "Portfolio", "return_pct": float(port_val)})
-            if nifty_val is not None and not pd.isna(nifty_val):
-                chart_rows.append({"year": yr, "series": "Nifty 50 (^NSEI)", "return_pct": float(nifty_val)})
-    
+        for yr in years_list:
+            port_row = per_year_df[per_year_df["year"] == yr]
+            port_val = port_row.iloc[0]["return_pct"] if not port_row.empty else None
+            nifty_val = nifty_map.get(yr, None)
+            # Portfolio bar
+            chart_rows.append({
+                "year": yr, "series": "Portfolio",
+                "return_pct": float(port_val) if port_val is not None and not pd.isna(port_val) else np.nan
+            })
+            # Nifty bar
+            chart_rows.append({
+                "year": yr, "series": "Nifty 50 (^NSEI)",
+                "return_pct": float(nifty_val) if nifty_val is not None and not pd.isna(nifty_val) else np.nan
+            })
+
         chart_df = pd.DataFrame(chart_rows)
+        chart_df = chart_df.dropna(subset=["return_pct"])
+
         if not chart_df.empty:
             chart_df["label"] = chart_df["return_pct"].round(1).astype(str) + "%"
-    
+
             bars = alt.Chart(chart_df).mark_bar().encode(
                 x=alt.X("year:O", title="Year", sort=sorted(chart_df["year"].unique())),
                 y=alt.Y("return_pct:Q", title="Return %"),
@@ -731,29 +736,32 @@ with tabs[1]:
                 text=alt.Text("label:N"),
                 xOffset=alt.XOffset("series:N"),
             )
-    
+
             chart = (bars + text_pos + text_neg).properties(height=420)
             st.altair_chart(chart, use_container_width=True)
         else:
             st.info("No yearly returns available to plot.")
-    
-        # Optional: data table under the chart (unchanged logic)
+
+        # Data table under the chart: includes both Portfolio and Nifty returns for each year
         display_rows = []
-        for _, r in per_year_df.iterrows():
+        for yr in years_list:
+            port_row = per_year_df[per_year_df["year"] == yr]
+            nifty_val = nifty_map.get(yr, None)
             display_rows.append({
-                "Year": int(r["year"]),
-                "BMV": inr_format(r["BMV"]),
-                "EMV": inr_format(r["EMV"]),
-                "Net Flows (₹)": inr_format(r["net_flows"]),
-                "Total Return (₹)": inr_format(r["total_return_amt"]),
-                "Return (%)": f"{round(r['return_pct'],2)}%" if r["return_pct"] is not None and not pd.isna(r["return_pct"]) else "N/A",
-                "Realized (₹)": inr_format(r["realized_amt"]),
-                "Unrealized (₹)": inr_format(r["unrealized_amt"]),
-                "Avg Portfolio Value (₹)": inr_format(r["avg_portfolio_val"]) if r["avg_portfolio_val"] else "N/A",
+                "Year": int(yr),
+                "BMV": inr_format(port_row.iloc[0]["BMV"]) if not port_row.empty else "N/A",
+                "EMV": inr_format(port_row.iloc[0]["EMV"]) if not port_row.empty else "N/A",
+                "Net Flows (₹)": inr_format(port_row.iloc[0]["net_flows"]) if not port_row.empty else "N/A",
+                "Total Return (₹)": inr_format(port_row.iloc[0]["total_return_amt"]) if not port_row.empty else "N/A",
+                "Portfolio Return (%)": f"{round(port_row.iloc[0]['return_pct'],2)}%" if not port_row.empty and port_row.iloc[0]["return_pct"] is not None and not pd.isna(port_row.iloc[0]["return_pct"]) else "N/A",
+                "Nifty 50 Return (%)": f"{round(nifty_val,2)}%" if nifty_val is not None and not pd.isna(nifty_val) else "N/A",
+                "Realized (₹)": inr_format(port_row.iloc[0]["realized_amt"]) if not port_row.empty else "N/A",
+                "Unrealized (₹)": inr_format(port_row.iloc[0]["unrealized_amt"]) if not port_row.empty else "N/A",
+                "Avg Portfolio Value (₹)": inr_format(port_row.iloc[0]["avg_portfolio_val"]) if not port_row.empty and port_row.iloc[0]["avg_portfolio_val"] else "N/A",
             })
         year_table_df = pd.DataFrame(display_rows)
         st.dataframe(year_table_df)
-    
+
         if missing_prices:
             st.warning("Used last trade price fallback when Yahoo historical prices were missing for some tickers/dates.")
             st.write(sorted(list(set(missing_prices)))[:20])
