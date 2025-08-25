@@ -385,7 +385,6 @@ def compute_yearly_metrics_from_trades(history_df):
 # --- Nifty 50 yearly returns for given years (single fetch; same index as headline: ^NSEI) ---
 
 def compute_nifty_yearly_returns(years, first_trade=None):
-    # Pull a wide window to cover all years
     today = pd.Timestamp(datetime.date.today())
     min_year = min(years)
     max_year = max(years)
@@ -395,17 +394,19 @@ def compute_nifty_yearly_returns(years, first_trade=None):
     if hist is None or hist.empty:
         return {}
     closes = hist["Close"]
+    # Make closes index timezone-naive
+    closes.index = closes.index.tz_localize(None)
     out = {}
     for i, year in enumerate(sorted(years)):
         # For the first year, start with first_trade date
         if i == 0 and first_trade is not None:
-            start_dt = pd.Timestamp(first_trade)
+            start_dt = pd.Timestamp(first_trade).tz_localize(None)
         else:
-            start_dt = pd.Timestamp(datetime.date(year, 1, 1))
-        if year == pd.Timestamp(today).year:
-            end_dt = today
+            start_dt = pd.Timestamp(datetime.date(year, 1, 1)).tz_localize(None)
+        if year == today.year:
+            end_dt = today.tz_localize(None)
         else:
-            end_dt = pd.Timestamp(datetime.date(year, 12, 31))
+            end_dt = pd.Timestamp(datetime.date(year, 12, 31)).tz_localize(None)
         # Get last close on or before start
         start_prices = closes[closes.index <= start_dt]
         end_prices = closes[closes.index <= end_dt]
