@@ -384,39 +384,39 @@ def compute_yearly_metrics_from_trades(history_df):
 
 # --- Nifty 50 yearly returns for given years (single fetch; same index as headline: ^NSEI) ---
 
-def compute_nifty_yearly_returns(years):
-    if not years:
-        return {}
+def compute_nifty_yearly_returns(years, first_trade=None):
+    # Pull a wide window to cover all years
+    today = pd.Timestamp(datetime.date.today())
     min_year = min(years)
     max_year = max(years)
-    today = pd.Timestamp(datetime.date.today())
-    start_all = pd.Timestamp(datetime.date(min_year, 1, 1)) - pd.Timedelta(days=60)
-    end_all = min(pd.Timestamp(datetime.date(max_year, 12, 31)), today)
-    try:
-        hist = yf.Ticker("^NSEI").history(
-            start=start_all.strftime("%Y-%m-%d"),
-            end=(end_all + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-        )
-        if hist is None or hist.empty:
-            return {}
-        out = {}
-        for y in years:
-            ys = pd.Timestamp(datetime.date(y, 1, 1))
-            ye = min(pd.Timestamp(datetime.date(y, 12, 31)), today)
-            if ye < ys:
-                continue
-            s_series = hist[hist.index <= ys]
-            e_series = hist[hist.index <= ye]
-            if e_series.empty:
-                continue
-            start_val = s_series["Close"].iloc[-1] if not s_series.empty else hist["Close"].iloc[0]
-            end_val = e_series["Close"].iloc[-1]
-            if start_val and start_val != 0:
-                out[y] = (end_val / start_val - 1.0) * 100.0
-        return out
-    except Exception:
+    start_all = pd.Timestamp(datetime.date(min_year, 1, 1)) - pd.Timedelta(days=10)
+    end_all = min(pd.Timestamp(datetime.date(max_year, 12, 31)), today) + pd.Timedelta(days=1)
+    hist = yf.Ticker("^NSEI").history(start=start_all.strftime("%Y-%m-%d"), end=end_all.strftime("%Y-%m-%d"))
+    if hist is None or hist.empty:
         return {}
-
+    closes = hist["Close"]
+    out = {}
+    for i, year in enumerate(sorted(years)):
+        # For the first year, start with first_trade date
+        if i == 0 and first_trade is not None:
+            start_dt = pd.Timestamp(first_trade)
+        else:
+            start_dt = pd.Timestamp(datetime.date(year, 1, 1))
+        if year == pd.Timestamp(today).year:
+            end_dt = today
+        else:
+            end_dt = pd.Timestamp(datetime.date(year, 12, 31))
+        # Get last close on or before start
+        start_prices = closes[closes.index <= start_dt]
+        end_prices = closes[closes.index <= end_dt]
+        if not start_prices.empty and not end_prices.empty:
+            start_val = start_prices.iloc[-1]
+            end_val = end_prices.iloc[-1]
+            out[year] = (end_val / start_val - 1.0) * 100.0
+        else:
+            out[year] = None
+    return out
+    
 # --- P&L timeline (cumulative total = realized + unrealized estimate using last trade prices) ---
 
 def pnl_over_time(history_df):
@@ -687,8 +687,8 @@ with tabs[1]:
 
         # Years we need to compare
         years_list = per_year_df["year"].astype(int).tolist()
-        nifty_map = compute_nifty_yearly_returns(years_list)  # uses ^NSEI internally
-
+        nifty_map = compute_nifty_yearly_returns(years_list, first_trade=history_df["date"].min())
+        
         # Always build chart data for all years (show both, even if portfolio return is missing)
         chart_rows = []
         for yr in years_list:
