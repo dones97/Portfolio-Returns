@@ -706,10 +706,7 @@ with tabs[1]:
         chart_df = pd.DataFrame(chart_rows)
         chart_df = chart_df.dropna(subset=["return_pct"])
         chart_df["label"] = chart_df["return_pct"].round(1).astype(str) + "%"
-
-        # Add color column for label: green for positive, red for negative
-        chart_df["label_color"] = np.where(chart_df["return_pct"] >= 0, "green", "red")
-
+        
         if not chart_df.empty:
             bars = alt.Chart(chart_df).mark_bar().encode(
                 x=alt.X("year:O", title="Year", sort=sorted(chart_df["year"].unique())),
@@ -722,29 +719,26 @@ with tabs[1]:
                     alt.Tooltip("return_pct:Q", title="Return %", format=".2f"),
                 ],
             )
-
-            # Green labels above positive bars
+        
+            # Labels: set color directly, do NOT encode
             text_pos = alt.Chart(chart_df[chart_df["return_pct"] >= 0]).mark_text(
-                dy=-6, fontSize=11
+                dy=-6, fontSize=11, color="green"
             ).encode(
                 x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
                 y=alt.Y("return_pct:Q"),
                 text=alt.Text("label:N"),
                 xOffset=alt.XOffset("series:N"),
-                color=alt.Color("label_color:N", scale=alt.Scale(domain=["green"], range=["green"]), legend=None),
             )
-
-            # Red labels below negative bars
+        
             text_neg = alt.Chart(chart_df[chart_df["return_pct"] < 0]).mark_text(
-                dy=12, fontSize=11
+                dy=12, fontSize=11, color="red"
             ).encode(
                 x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
                 y=alt.Y("return_pct:Q"),
                 text=alt.Text("label:N"),
                 xOffset=alt.XOffset("series:N"),
-                color=alt.Color("label_color:N", scale=alt.Scale(domain=["red"], range=["red"]), legend=None),
             )
-
+        
             chart = (bars + text_pos + text_neg).properties(height=420)
             st.altair_chart(chart, use_container_width=True)
         else:
