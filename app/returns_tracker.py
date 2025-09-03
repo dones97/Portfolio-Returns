@@ -775,30 +775,40 @@ with tabs[1]:
     st.markdown("---")
     st.subheader("Portfolio vs Nifty 50: Monthly Returns Comparison")
 
-    # Step 1: Prepare monthly end dates from portfolio
+    # Prepare monthly periods
     history_df["month"] = history_df["date"].dt.to_period("M")
     month_end_dates = history_df.groupby("month")["date"].max().sort_values()
 
-    # Step 2: Calculate end-of-month portfolio value
-    # We'll reuse your holdings_as_of logic for each month end
-    def holdings_as_of(dt, inclusive=True):
-        mask = history_df["date"] <= pd.to_datetime(dt) if inclusive else history_df["date"] < pd.to_datetime(dt)
-        sub = history_df.loc[mask].dropna(subset=["yahoo_ticker"])
-        net = {}
-        for t, grp in sub.groupby("yahoo_ticker"):
-            buy_qty = grp[grp["side"].str.lower() == "buy"]["quantity"].astype(float).sum()
-            sell_qty = grp[grp["side"].str.lower() == "sell"]["quantity"].astype(float).sum()
-            net[t] = buy_qty - sell_qty
-        return net
+    # Get unique tickers
+    tickers = history_df["yahoo_ticker"].dropna().unique().tolist()
 
+    # Fetch all prices at once for each ticker over the date range
+    start_date = month_end_dates.min().strftime("%Y-%m-%d")
+    end_date = (month_end_dates.max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    prices_dict = {}
+    for t in tickers:
+        try:
+            hist = yf.Ticker(t).history(start=start_date, end=end_date)
+            if hist is not None and not hist.empty:
+                hist = hist[["Close"]].reset_index()
+                hist["date"] = pd.to_datetime(hist["Date"])
+                hist["month"] = hist["date"].dt.to_period("M")
+                prices_dict[t] = hist.groupby("month")["Close"].last()  # end-of-month price
+        except Exception:
+            continue
+
+    # Calculate end-of-month portfolio value for each month
     monthly_rows = []
     for m, dt in month_end_dates.items():
-        holdings = holdings_as_of(dt, inclusive=True)
+        holdings = history_df.loc[history_df["date"] <= dt].groupby("yahoo_ticker").apply(
+            lambda x: x.loc[x["side"].str.lower() == "buy", "quantity"].astype(float).sum() -
+                      x.loc[x["side"].str.lower() == "sell", "quantity"].astype(float).sum()
+        )
         port_val = 0.0
         for t, qty in holdings.items():
-            if qty == 0:
+            if qty == 0 or t not in prices_dict:
                 continue
-            price = get_prev_trading_price(t, dt)
+            price = prices_dict[t].get(m, None)
             if price is not None:
                 port_val += qty * price
         monthly_rows.append({"month": str(m), "date": dt, "portfolio_value": port_val})
@@ -806,11 +816,11 @@ with tabs[1]:
     portfolio_monthly_df = pd.DataFrame(monthly_rows).sort_values("date")
     portfolio_monthly_df["portfolio_return"] = portfolio_monthly_df["portfolio_value"].pct_change() * 100
 
-    # Step 3: Get Nifty 50 monthly returns
-    if not portfolio_monthly_df.empty:
+    # Nifty 50 monthly returns
+    try:
         nifty_hist = yf.Ticker("^NSEI").history(
-            start=portfolio_monthly_df["date"].min().strftime("%Y-%m-%d"),
-            end=(portfolio_monthly_df["date"].max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            start=start_date,
+            end=end_date
         )
         nifty_hist.index = nifty_hist.index.tz_localize(None)
         nifty_monthly = nifty_hist["Close"].resample("M").last()
@@ -819,27 +829,29 @@ with tabs[1]:
             "month": nifty_monthly.index.to_period("M").astype(str),
             "nifty_return": nifty_monthly_return.values
         })
+    except Exception:
+        nifty_monthly_df = pd.DataFrame(columns=["month", "nifty_return"])
 
-        # Step 4: Merge both series
-        merged_df = pd.merge(
-            portfolio_monthly_df[["month", "portfolio_return"]],
-            nifty_monthly_df[["month", "nifty_return"]],
-            on="month", how="inner"
-        ).dropna(subset=["portfolio_return", "nifty_return"])
+    # Merge
+    merged_df = pd.merge(
+        portfolio_monthly_df[["month", "portfolio_return"]],
+        nifty_monthly_df[["month", "nifty_return"]],
+        on="month", how="inner"
+    ).dropna(subset=["portfolio_return", "nifty_return"])
 
-        # Step 5: Prepare data for Altair
-        plot_df = merged_df.melt(
-            id_vars=["month"],
-            value_vars=["portfolio_return", "nifty_return"],
-            var_name="series",
-            value_name="return_pct"
-        )
-        # Make legend more readable
-        plot_df["series"] = plot_df["series"].map({
-            "portfolio_return": "Portfolio",
-            "nifty_return": "Nifty 50 (^NSEI)"
-        })
+    # Prepare for Altair
+    plot_df = merged_df.melt(
+        id_vars=["month"],
+        value_vars=["portfolio_return", "nifty_return"],
+        var_name="series",
+        value_name="return_pct"
+    )
+    plot_df["series"] = plot_df["series"].map({
+        "portfolio_return": "Portfolio",
+        "nifty_return": "Nifty 50 (^NSEI)"
+    })
 
+    if not plot_df.empty:
         chart_monthly = alt.Chart(plot_df).mark_line(point=True).encode(
             x=alt.X("month:O", title="Month"),
             y=alt.Y("return_pct:Q", title="Monthly Return (%)"),
