@@ -706,7 +706,7 @@ with tabs[1]:
         chart_df = pd.DataFrame(chart_rows)
         chart_df = chart_df.dropna(subset=["return_pct"])
         chart_df["label"] = chart_df["return_pct"].round(1).astype(str) + "%"
-        
+
         if not chart_df.empty:
             bars = alt.Chart(chart_df).mark_bar().encode(
                 x=alt.X("year:O", title="Year", sort=sorted(chart_df["year"].unique())),
@@ -720,9 +720,9 @@ with tabs[1]:
                 ],
             )
         
-            # Labels: set color directly, do NOT encode
+            # Overlay positive labels in green
             text_pos = alt.Chart(chart_df[chart_df["return_pct"] >= 0]).mark_text(
-                dy=-6, fontSize=11, color="green"
+                dy=-10, fontSize=13, color="green"
             ).encode(
                 x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
                 y=alt.Y("return_pct:Q"),
@@ -730,8 +730,9 @@ with tabs[1]:
                 xOffset=alt.XOffset("series:N"),
             )
         
+            # Overlay negative labels in red
             text_neg = alt.Chart(chart_df[chart_df["return_pct"] < 0]).mark_text(
-                dy=12, fontSize=11, color="red"
+                dy=12, fontSize=13, color="red"
             ).encode(
                 x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
                 y=alt.Y("return_pct:Q"),
@@ -743,7 +744,6 @@ with tabs[1]:
             st.altair_chart(chart, use_container_width=True)
         else:
             st.info("No yearly returns available to plot.")
-
     
         # Data table under the chart: includes both Portfolio and Nifty returns for each year
         display_rows = []
