@@ -769,8 +769,92 @@ with tabs[1]:
             st.warning("Used last trade price fallback when Yahoo historical prices were missing for some tickers/dates.")
             st.write(sorted(list(set(missing_prices)))[:20])
 
-
     st.markdown("---")
+
+    # --- Portfolio vs Nifty 50: Monthly Returns Comparison ---
+    st.markdown("---")
+    st.subheader("Portfolio vs Nifty 50: Monthly Returns Comparison")
+
+    # Step 1: Prepare monthly end dates from portfolio
+    history_df["month"] = history_df["date"].dt.to_period("M")
+    month_end_dates = history_df.groupby("month")["date"].max().sort_values()
+
+    # Step 2: Calculate end-of-month portfolio value
+    # We'll reuse your holdings_as_of logic for each month end
+    def holdings_as_of(dt, inclusive=True):
+        mask = history_df["date"] <= pd.to_datetime(dt) if inclusive else history_df["date"] < pd.to_datetime(dt)
+        sub = history_df.loc[mask].dropna(subset=["yahoo_ticker"])
+        net = {}
+        for t, grp in sub.groupby("yahoo_ticker"):
+            buy_qty = grp[grp["side"].str.lower() == "buy"]["quantity"].astype(float).sum()
+            sell_qty = grp[grp["side"].str.lower() == "sell"]["quantity"].astype(float).sum()
+            net[t] = buy_qty - sell_qty
+        return net
+
+    monthly_rows = []
+    for m, dt in month_end_dates.items():
+        holdings = holdings_as_of(dt, inclusive=True)
+        port_val = 0.0
+        for t, qty in holdings.items():
+            if qty == 0:
+                continue
+            price = get_prev_trading_price(t, dt)
+            if price is not None:
+                port_val += qty * price
+        monthly_rows.append({"month": str(m), "date": dt, "portfolio_value": port_val})
+
+    portfolio_monthly_df = pd.DataFrame(monthly_rows).sort_values("date")
+    portfolio_monthly_df["portfolio_return"] = portfolio_monthly_df["portfolio_value"].pct_change() * 100
+
+    # Step 3: Get Nifty 50 monthly returns
+    if not portfolio_monthly_df.empty:
+        nifty_hist = yf.Ticker("^NSEI").history(
+            start=portfolio_monthly_df["date"].min().strftime("%Y-%m-%d"),
+            end=(portfolio_monthly_df["date"].max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        )
+        nifty_hist.index = nifty_hist.index.tz_localize(None)
+        nifty_monthly = nifty_hist["Close"].resample("M").last()
+        nifty_monthly_return = nifty_monthly.pct_change() * 100
+        nifty_monthly_df = pd.DataFrame({
+            "month": nifty_monthly.index.to_period("M").astype(str),
+            "nifty_return": nifty_monthly_return.values
+        })
+
+        # Step 4: Merge both series
+        merged_df = pd.merge(
+            portfolio_monthly_df[["month", "portfolio_return"]],
+            nifty_monthly_df[["month", "nifty_return"]],
+            on="month", how="inner"
+        ).dropna(subset=["portfolio_return", "nifty_return"])
+
+        # Step 5: Prepare data for Altair
+        plot_df = merged_df.melt(
+            id_vars=["month"],
+            value_vars=["portfolio_return", "nifty_return"],
+            var_name="series",
+            value_name="return_pct"
+        )
+        # Make legend more readable
+        plot_df["series"] = plot_df["series"].map({
+            "portfolio_return": "Portfolio",
+            "nifty_return": "Nifty 50 (^NSEI)"
+        })
+
+        chart_monthly = alt.Chart(plot_df).mark_line(point=True).encode(
+            x=alt.X("month:O", title="Month"),
+            y=alt.Y("return_pct:Q", title="Monthly Return (%)"),
+            color=alt.Color("series:N", title="Series"),
+            tooltip=[
+                alt.Tooltip("month:O", title="Month"),
+                alt.Tooltip("series:N", title="Series"),
+                alt.Tooltip("return_pct:Q", title="Return %", format=".2f")
+            ]
+        ).properties(height=320)
+
+        st.altair_chart(chart_monthly, use_container_width=True)
+        st.info("Monthly returns are calculated using end-of-month portfolio value and Nifty 50 closing price.")
+    else:
+        st.info("No portfolio data available for monthly returns comparison.")
 
     # --- Cumulative portfolio profit over time (Total = realized + unrealized estimate) ---
     st.subheader("Cumulative Portfolio Profit Over Time (INR)")
