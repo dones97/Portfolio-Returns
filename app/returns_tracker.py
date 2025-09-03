@@ -786,14 +786,11 @@ with tabs[1]:
             )
         )
 
-        # Stacked area chart for realized and unrealized, with realized first (bottom)
         stacked_df = pnl_ts.copy()
         stacked_df["date"] = pd.to_datetime(stacked_df["date"])
-        # Realized first, then unrealized to ensure stacking order
         stacked_df["Realized"] = stacked_df["realized_cum"]
         stacked_df["Unrealized"] = stacked_df["unrealized_est"]
 
-        # Specify ordering: Realized returns at the bottom, Unrealized on top
         area_data = stacked_df.melt(
             id_vars=["date"],
             value_vars=["Realized", "Unrealized"],
@@ -816,7 +813,7 @@ with tabs[1]:
             ]
         )
 
-        # Nifty 50 comparison line (unchanged)
+        # Nifty 50 comparison line WITH LEGEND
         trade_dates = pnl_ts["date"].sort_values().unique()
         first_trade_dt = pd.to_datetime(history_df["date"].min())
         last_trade_dt = pd.to_datetime(history_df["date"].max())
@@ -852,19 +849,58 @@ with tabs[1]:
                 invested -= cf
             curr_value = units * price
             cumulative_pnl = curr_value - invested
-            nifty_pnl_rows.append({"date": dt_naive, "Nifty_Cum_PNL": cumulative_pnl})
+            nifty_pnl_rows.append({
+                "date": dt_naive,
+                "Nifty_Cum_PNL": cumulative_pnl,
+                "series": "Nifty 50 Simulated"
+            })
 
+        # Combine for legend
         nifty_pnl_df = pd.DataFrame(nifty_pnl_rows)
         if not nifty_pnl_df.empty:
-            nifty_line = alt.Chart(nifty_pnl_df).mark_line(strokeDash=[7,3], color="green", strokeWidth=2).encode(
+            # Use color for legend, but keep line distinct
+            all_series_df = pd.concat([
+                area_data,
+                nifty_pnl_df.rename(columns={"Nifty_Cum_PNL": "value"})[["date", "series", "value"]]
+            ], ignore_index=True)
+
+            chart_area = alt.Chart(area_data).mark_area().encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("value:Q", axis=axis_indian, stack="zero"),
+                color=alt.Color("series:N", title="Series", scale=alt.Scale(
+                    domain=["Realized", "Unrealized", "Nifty 50 Simulated"],
+                    range=["#d62728", "#1f77b4", "green"]
+                )),
+                order=alt.Order('series', sort='ascending'),
+                opacity=alt.condition(
+                    alt.datum.series == "Nifty 50 Simulated",
+                    alt.value(0),  # Don't show area for Nifty
+                    alt.value(0.7)
+                ),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date"),
+                    alt.Tooltip("series:N", title="Series"),
+                    alt.Tooltip("value:Q", title="Cumulative (₹)", format=",.0f"),
+                ]
+            )
+
+            chart_nifty = alt.Chart(nifty_pnl_df).mark_line(
+                strokeDash=[7,3], color="green", strokeWidth=2
+            ).encode(
                 x=alt.X("date:T"),
                 y=alt.Y("Nifty_Cum_PNL:Q", axis=axis_indian),
+                color=alt.Color("series:N", title="Series", scale=alt.Scale(
+                    domain=["Realized", "Unrealized", "Nifty 50 Simulated"],
+                    range=["#d62728", "#1f77b4", "green"]
+                )),
                 tooltip=[
                     alt.Tooltip("date:T", title="Date"),
                     alt.Tooltip("Nifty_Cum_PNL:Q", title="Nifty Cumulative P&L (₹)", format=",.0f"),
+                    alt.Tooltip("series:N", title="Series"),
                 ]
             )
-            chart_pnl = (stacked_area + nifty_line).properties(height=320)
+
+            chart_pnl = (chart_area + chart_nifty).properties(height=320)
         else:
             chart_pnl = stacked_area.properties(height=320)
 
@@ -877,7 +913,7 @@ with tabs[1]:
             rt["realized_cum_INR"] = rt["realized_cum"].apply(inr_format)
             rt["unrealized_est_INR"] = rt["unrealized_est"].apply(inr_format)
             st.dataframe(rt[["date", "total_pnl_INR", "realized_cum_INR", "unrealized_est_INR"]])
-
+   
     st.markdown("---")
 
     # --- Realized / Unrealized tables (no styled variants) ---
