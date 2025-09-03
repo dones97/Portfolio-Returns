@@ -777,7 +777,6 @@ with tabs[1]:
     if pnl_ts.empty:
         st.info("No trades found to build profit timeline.")
     else:
-        # Axis that shows Indian units (K/L/Cr)
         axis_indian = alt.Axis(
             title="Cumulative Profit (₹)",
             labelExpr=(
@@ -787,25 +786,29 @@ with tabs[1]:
             )
         )
 
-        # Stacked area chart for realized and unrealized
+        # Stacked area chart for realized and unrealized, with realized first (bottom)
         stacked_df = pnl_ts.copy()
         stacked_df["date"] = pd.to_datetime(stacked_df["date"])
-        stacked_df["Unrealized"] = stacked_df["unrealized_est"]
+        # Realized first, then unrealized to ensure stacking order
         stacked_df["Realized"] = stacked_df["realized_cum"]
+        stacked_df["Unrealized"] = stacked_df["unrealized_est"]
 
+        # Specify ordering: Realized returns at the bottom, Unrealized on top
         area_data = stacked_df.melt(
             id_vars=["date"],
             value_vars=["Realized", "Unrealized"],
             var_name="series",
             value_name="value"
         )
+        area_data["series"] = pd.Categorical(area_data["series"], categories=["Realized", "Unrealized"], ordered=True)
 
         color_scale = alt.Scale(domain=["Realized", "Unrealized"], range=["#d62728", "#1f77b4"])
 
         stacked_area = alt.Chart(area_data).mark_area().encode(
             x=alt.X("date:T", title="Date"),
             y=alt.Y("value:Q", axis=axis_indian, stack="zero"),
-            color=alt.Color("series:N", title="Series", scale=color_scale),
+            color=alt.Color("series:N", title="Series", scale=color_scale, sort=["Realized", "Unrealized"]),
+            order=alt.Order('series', sort='ascending'),
             tooltip=[
                 alt.Tooltip("date:T", title="Date"),
                 alt.Tooltip("series:N", title="Series"),
@@ -813,8 +816,7 @@ with tabs[1]:
             ]
         )
 
-        # Nifty 50 comparison line
-        # Build cumulative cashflows invested in Nifty 50 over time
+        # Nifty 50 comparison line (unchanged)
         trade_dates = pnl_ts["date"].sort_values().unique()
         first_trade_dt = pd.to_datetime(history_df["date"].min())
         last_trade_dt = pd.to_datetime(history_df["date"].max())
@@ -825,16 +827,13 @@ with tabs[1]:
         nifty_hist.index = nifty_hist.index.tz_localize(None)
         nifty_closes = nifty_hist["Close"]
 
-        # Build cashflow timeline
         cashflows = build_cashflows_from_history(history_df)
-        # Only use buy/sell on actual trade dates
         cf_by_date = {}
         for amt, dt in cashflows:
             d = pd.Timestamp(dt).tz_localize(None)
             cf_by_date.setdefault(d, 0)
             cf_by_date[d] += amt
 
-        # Track cumulative invested in Nifty over time
         invested = 0.0
         units = 0.0
         nifty_pnl_rows = []
@@ -850,7 +849,7 @@ with tabs[1]:
                 invested += -cf
             elif cf > 0:  # sell
                 units -= (cf / price)
-                invested -= cf  # remove from invested
+                invested -= cf
             curr_value = units * price
             cumulative_pnl = curr_value - invested
             nifty_pnl_rows.append({"date": dt_naive, "Nifty_Cum_PNL": cumulative_pnl})
