@@ -677,7 +677,7 @@ with tabs[1]:
 
     st.markdown("---")
 
-     # --- Calendar-year comparison: grouped bars (Portfolio vs Nifty 50) ---
+    # --- Calendar-year comparison: grouped bars (Portfolio vs Nifty 50) ---
     st.subheader("Portfolio vs Nifty 50: Yearly Comparison (calendar years)")
 
     per_year_results, missing_prices = compute_yearly_metrics_from_trades(history_df)
@@ -686,22 +686,18 @@ with tabs[1]:
     else:
         per_year_df = pd.DataFrame(per_year_results)
 
-        # Years we need to compare
         years_list = per_year_df["year"].astype(int).tolist()
         nifty_map = compute_nifty_yearly_returns(years_list, first_trade=history_df["date"].min())
         
-        # Always build chart data for all years (show both, even if portfolio return is missing)
         chart_rows = []
         for yr in years_list:
             port_row = per_year_df[per_year_df["year"] == yr]
             port_val = port_row.iloc[0]["return_pct"] if not port_row.empty else None
             nifty_val = nifty_map.get(yr, None)
-            # Portfolio bar
             chart_rows.append({
                 "year": yr, "series": "Portfolio",
                 "return_pct": float(port_val) if port_val is not None and not pd.isna(port_val) else np.nan
             })
-            # Nifty bar
             chart_rows.append({
                 "year": yr, "series": "Nifty 50 (^NSEI)",
                 "return_pct": float(nifty_val) if nifty_val is not None and not pd.isna(nifty_val) else np.nan
@@ -709,10 +705,12 @@ with tabs[1]:
 
         chart_df = pd.DataFrame(chart_rows)
         chart_df = chart_df.dropna(subset=["return_pct"])
+        chart_df["label"] = chart_df["return_pct"].round(1).astype(str) + "%"
+
+        # Add color column for label: green for positive, red for negative
+        chart_df["label_color"] = np.where(chart_df["return_pct"] >= 0, "green", "red")
 
         if not chart_df.empty:
-            chart_df["label"] = chart_df["return_pct"].round(1).astype(str) + "%"
-
             bars = alt.Chart(chart_df).mark_bar().encode(
                 x=alt.X("year:O", title="Year", sort=sorted(chart_df["year"].unique())),
                 y=alt.Y("return_pct:Q", title="Return %"),
@@ -724,18 +722,27 @@ with tabs[1]:
                     alt.Tooltip("return_pct:Q", title="Return %", format=".2f"),
                 ],
             )
-            # Place labels above/below bars
-            text_pos = alt.Chart(chart_df[chart_df["return_pct"] >= 0]).mark_text(dy=-6, fontSize=11).encode(
+
+            # Green labels above positive bars
+            text_pos = alt.Chart(chart_df[chart_df["return_pct"] >= 0]).mark_text(
+                dy=-6, fontSize=11
+            ).encode(
                 x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
                 y=alt.Y("return_pct:Q"),
                 text=alt.Text("label:N"),
                 xOffset=alt.XOffset("series:N"),
+                color=alt.Color("label_color:N", scale=alt.Scale(domain=["green"], range=["green"]), legend=None),
             )
-            text_neg = alt.Chart(chart_df[chart_df["return_pct"] < 0]).mark_text(dy=12, fontSize=11).encode(
+
+            # Red labels below negative bars
+            text_neg = alt.Chart(chart_df[chart_df["return_pct"] < 0]).mark_text(
+                dy=12, fontSize=11
+            ).encode(
                 x=alt.X("year:O", sort=sorted(chart_df["year"].unique())),
                 y=alt.Y("return_pct:Q"),
                 text=alt.Text("label:N"),
                 xOffset=alt.XOffset("series:N"),
+                color=alt.Color("label_color:N", scale=alt.Scale(domain=["red"], range=["red"]), legend=None),
             )
 
             chart = (bars + text_pos + text_neg).properties(height=420)
@@ -743,6 +750,7 @@ with tabs[1]:
         else:
             st.info("No yearly returns available to plot.")
 
+    
         # Data table under the chart: includes both Portfolio and Nifty returns for each year
         display_rows = []
         for yr in years_list:
