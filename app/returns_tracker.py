@@ -787,29 +787,88 @@ with tabs[1]:
             )
         )
 
-        # Fold to show legend (Total as area, Realized as line)
-        fold_df = pnl_ts.melt(id_vars=["date"], value_vars=["total_pnl", "realized_cum"],
-                              var_name="series", value_name="value")
+        # Stacked area chart for realized and unrealized
+        stacked_df = pnl_ts.copy()
+        stacked_df["date"] = pd.to_datetime(stacked_df["date"])
+        stacked_df["Unrealized"] = stacked_df["unrealized_est"]
+        stacked_df["Realized"] = stacked_df["realized_cum"]
 
-        color_scale = alt.Scale(domain=["total_pnl", "realized_cum"], range=["#1f77b4", "#d62728"])
-
-        area = alt.Chart(fold_df[fold_df["series"] == "total_pnl"]).mark_area(opacity=0.35).encode(
-            x=alt.X("date:T", title="Date"),
-            y=alt.Y("value:Q", axis=axis_indian),
-            color=alt.Color("series:N", title="Series", scale=color_scale),
-            tooltip=[alt.Tooltip("date:T", title="Date"),
-                     alt.Tooltip("value:Q", title="Total P&L (₹)", format=",.0f")]
+        area_data = stacked_df.melt(
+            id_vars=["date"],
+            value_vars=["Realized", "Unrealized"],
+            var_name="series",
+            value_name="value"
         )
 
-        line = alt.Chart(fold_df[fold_df["series"] == "realized_cum"]).mark_line(strokeWidth=2).encode(
+        color_scale = alt.Scale(domain=["Realized", "Unrealized"], range=["#d62728", "#1f77b4"])
+
+        stacked_area = alt.Chart(area_data).mark_area().encode(
             x=alt.X("date:T", title="Date"),
-            y=alt.Y("value:Q", axis=axis_indian),
+            y=alt.Y("value:Q", axis=axis_indian, stack="zero"),
             color=alt.Color("series:N", title="Series", scale=color_scale),
-            tooltip=[alt.Tooltip("date:T", title="Date"),
-                     alt.Tooltip("value:Q", title="Realized (₹)", format=",.0f")]
+            tooltip=[
+                alt.Tooltip("date:T", title="Date"),
+                alt.Tooltip("series:N", title="Series"),
+                alt.Tooltip("value:Q", title="Cumulative (₹)", format=",.0f"),
+            ]
         )
 
-        chart_pnl = (area + line).properties(height=320)
+        # Nifty 50 comparison line
+        # Build cumulative cashflows invested in Nifty 50 over time
+        trade_dates = pnl_ts["date"].sort_values().unique()
+        first_trade_dt = pd.to_datetime(history_df["date"].min())
+        last_trade_dt = pd.to_datetime(history_df["date"].max())
+        nifty_hist = yf.Ticker("^NSEI").history(
+            start=first_trade_dt.strftime("%Y-%m-%d"),
+            end=(last_trade_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        )
+        nifty_hist.index = nifty_hist.index.tz_localize(None)
+        nifty_closes = nifty_hist["Close"]
+
+        # Build cashflow timeline
+        cashflows = build_cashflows_from_history(history_df)
+        # Only use buy/sell on actual trade dates
+        cf_by_date = {}
+        for amt, dt in cashflows:
+            d = pd.Timestamp(dt).tz_localize(None)
+            cf_by_date.setdefault(d, 0)
+            cf_by_date[d] += amt
+
+        # Track cumulative invested in Nifty over time
+        invested = 0.0
+        units = 0.0
+        nifty_pnl_rows = []
+        for dt in trade_dates:
+            dt_naive = pd.Timestamp(dt).tz_localize(None)
+            price_series = nifty_closes[nifty_closes.index <= dt_naive]
+            if price_series.empty:
+                continue
+            price = price_series.iloc[-1]
+            cf = cf_by_date.get(dt_naive, 0)
+            if cf < 0:  # buy
+                units += (-cf) / price
+                invested += -cf
+            elif cf > 0:  # sell
+                units -= (cf / price)
+                invested -= cf  # remove from invested
+            curr_value = units * price
+            cumulative_pnl = curr_value - invested
+            nifty_pnl_rows.append({"date": dt_naive, "Nifty_Cum_PNL": cumulative_pnl})
+
+        nifty_pnl_df = pd.DataFrame(nifty_pnl_rows)
+        if not nifty_pnl_df.empty:
+            nifty_line = alt.Chart(nifty_pnl_df).mark_line(strokeDash=[7,3], color="green", strokeWidth=2).encode(
+                x=alt.X("date:T"),
+                y=alt.Y("Nifty_Cum_PNL:Q", axis=axis_indian),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date"),
+                    alt.Tooltip("Nifty_Cum_PNL:Q", title="Nifty Cumulative P&L (₹)", format=",.0f"),
+                ]
+            )
+            chart_pnl = (stacked_area + nifty_line).properties(height=320)
+        else:
+            chart_pnl = stacked_area.properties(height=320)
+
         st.altair_chart(chart_pnl, use_container_width=True)
 
         with st.expander("Profit timeline table"):
