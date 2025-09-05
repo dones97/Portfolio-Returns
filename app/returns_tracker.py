@@ -917,6 +917,137 @@ with tabs[1]:
    
     st.markdown("---")
 
+        # --- Portfolio Value Over Time (Stacked: Invested + Profit), vs Nifty 50 ---
+    st.subheader("Portfolio Value Over Time (INR)")
+
+    if pnl_ts.empty:
+        st.info("No trades found to build portfolio value timeline.")
+    else:
+        # Calculate invested amount over time
+        history_df_sorted = history_df.sort_values("date")
+        cumsum_cf = []
+        net_invested = 0.0
+        cf_dates = []
+        for _, r in history_df_sorted.iterrows():
+            amt = float(r["quantity"]) * float(r["price"])
+            if str(r["side"]).strip().lower().startswith("buy"):
+                net_invested += amt
+            else:
+                net_invested -= amt
+            cf_dates.append(r["date"])
+            cumsum_cf.append(net_invested)
+        # Map to unique dates for merge with pnl_ts
+        invested_ts = pd.DataFrame({"date": cf_dates, "invested": cumsum_cf}).drop_duplicates("date")
+        # Merge with pnl_ts to align dates
+        value_ts = pd.merge(pnl_ts, invested_ts, on="date", how="left").sort_values("date")
+        value_ts["invested"] = value_ts["invested"].ffill().fillna(0.0)
+        value_ts["portfolio_value"] = value_ts["invested"] + value_ts["total_pnl"]
+        value_ts["profit"] = value_ts["total_pnl"]
+        # Prepare stacked area data
+        area_value = value_ts.melt(
+            id_vars=["date"], 
+            value_vars=["invested", "profit"],
+            var_name="series", 
+            value_name="amount"
+        )
+        area_value["series"] = pd.Categorical(area_value["series"], categories=["invested", "profit"], ordered=True)
+
+        color_scale_val = alt.Scale(domain=["invested", "profit"], range=["#d3d3d3", "#86c06c"])
+        axis_indian_val = alt.Axis(
+            title="Portfolio Value (₹)",
+            labelExpr=(
+                "datum.value >= 1e7 ? format(datum.value/1e7, ',.1f') + ' Cr' : "
+                "datum.value >= 1e5 ? format(datum.value/1e5, ',.1f') + ' L' : "
+                "datum.value >= 1e3 ? format(datum.value/1e3, ',.0f') + ' K' : format(datum.value, ',')"
+            )
+        )
+
+        stacked_val = alt.Chart(area_value).mark_area().encode(
+            x=alt.X("date:T", title="Date"),
+            y=alt.Y("amount:Q", stack="zero", axis=axis_indian_val),
+            color=alt.Color("series:N", title="Component", scale=color_scale_val, sort=["invested", "profit"]),
+            order=alt.Order('series', sort='ascending'),
+            tooltip=[
+                alt.Tooltip("date:T", title="Date"),
+                alt.Tooltip("series:N", title="Component"),
+                alt.Tooltip("amount:Q", title="Amount (₹)", format=",.0f"),
+            ]
+        )
+
+        # Nifty 50 "all invested" simulated value line (use same logic as in profit plot)
+        nifty_val_rows = []
+        invested_nifty = 0.0
+        units_nifty = 0.0
+        for dt in value_ts["date"]:
+            dt_naive = pd.Timestamp(dt).tz_localize(None)
+            price_series = nifty_closes[nifty_closes.index <= dt_naive]
+            if price_series.empty:
+                continue
+            price = price_series.iloc[-1]
+            cf = cf_by_date.get(dt_naive, 0)
+            if cf < 0:  # Buy
+                units_nifty += (-cf) / price
+                invested_nifty += -cf
+            elif cf > 0:  # Sell
+                units_nifty -= (cf / price)
+                invested_nifty -= cf
+            curr_value = units_nifty * price
+            nifty_val_rows.append({
+                "date": dt_naive,
+                "Nifty_Portfolio_Value": curr_value,
+                "series": "Nifty 50 Simulated"
+            })
+        nifty_val_df = pd.DataFrame(nifty_val_rows)
+
+        # Compose final chart with legend
+        if not nifty_val_df.empty:
+            chart_area_val = alt.Chart(area_value).mark_area().encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("amount:Q", axis=axis_indian_val, stack="zero"),
+                color=alt.Color("series:N", title="Component", scale=alt.Scale(
+                    domain=["invested", "profit", "Nifty 50 Simulated"],
+                    range=["#d3d3d3", "#86c06c", "green"]
+                )),
+                order=alt.Order('series', sort='ascending'),
+                opacity=alt.condition(
+                    alt.datum.series == "Nifty 50 Simulated",
+                    alt.value(0),  # Don't show area for Nifty
+                    alt.value(0.7)
+                ),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date"),
+                    alt.Tooltip("series:N", title="Component"),
+                    alt.Tooltip("amount:Q", title="Amount (₹)", format=",.0f"),
+                ]
+            )
+            chart_nifty_val = alt.Chart(nifty_val_df).mark_line(
+                strokeDash=[7,3], color="green", strokeWidth=2
+            ).encode(
+                x=alt.X("date:T"),
+                y=alt.Y("Nifty_Portfolio_Value:Q", axis=axis_indian_val),
+                color=alt.Color("series:N", title="Series", scale=alt.Scale(
+                    domain=["invested", "profit", "Nifty 50 Simulated"],
+                    range=["#d3d3d3", "#86c06c", "green"]
+                )),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date"),
+                    alt.Tooltip("Nifty_Portfolio_Value:Q", title="Nifty Portfolio Value (₹)", format=",.0f"),
+                    alt.Tooltip("series:N", title="Series"),
+                ]
+            )
+            chart_val = (chart_area_val + chart_nifty_val).properties(height=320)
+        else:
+            chart_val = stacked_val.properties(height=320)
+        st.altair_chart(chart_val, use_container_width=True)
+
+        with st.expander("Portfolio value timeline table"):
+            vt = value_ts.copy()
+            vt["date"] = vt["date"].dt.date
+            vt["portfolio_value_INR"] = vt["portfolio_value"].apply(inr_format)
+            vt["invested_INR"] = vt["invested"].apply(inr_format)
+            vt["profit_INR"] = vt["profit"].apply(inr_format)
+            st.dataframe(vt[["date", "portfolio_value_INR", "invested_INR", "profit_INR"]])
+
     # --- Realized / Unrealized tables (no styled variants) ---
     st.subheader("Realized Returns (Average Costing)")
     if not realized_df.empty:
