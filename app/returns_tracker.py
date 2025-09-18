@@ -690,7 +690,7 @@ with tabs[1]:
     st.markdown("---")
 
     # --- Calendar-year comparison: grouped bars (Portfolio vs Nifty 50) ---
-    st.subheader("Portfolio vs Nifty 50: Yearly Comparison (calendar years)")
+    st.subheader("Portfolio vs Nifty 50: Yearly Comparison (financial years)")
 
     per_year_results, missing_prices = compute_yearly_metrics_from_trades(history_df)
     if not per_year_results:
