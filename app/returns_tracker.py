@@ -712,7 +712,7 @@ with tabs[1]:
                 "return_pct": float(port_val) if port_val is not None and not pd.isna(port_val) else np.nan
             })
             chart_rows.append({
-                "year": year_label, "series": "Nifty 50 (^NSEI)",
+                "year": year_label, "series": "Nifty 50",
                 "return_pct": float(nifty_val) if nifty_val is not None and not pd.isna(nifty_val) else np.nan
             })
 
