@@ -12,6 +12,18 @@ MAPPINGS_CSV = "ticker_mappings.csv"
 TRADE_REPORTS_DIR = "trade_reports"
 PORTFOLIO_HISTORY_CSV = "portfolio_history.csv"
 
+def get_financial_year(dt):
+    """Given a date, return the start year of the financial year (e.g., 2022 for FY 2022-23)."""
+    dt = pd.to_datetime(dt)
+    year = dt.year
+    if dt.month < 4:
+        return year - 1
+    else:
+        return year
+
+def format_fin_year(y):
+    return f"{y}-{str(y+1)[-2:]}"
+
 # --- TICKER MAPPING / IO ---
 
 def load_user_mappings():
@@ -250,7 +262,7 @@ def compute_realized_pl_by_year(history_df):
         side = str(r["side"]).strip().lower()
         qty = float(r["quantity"])
         price = float(r["price"])
-        year = pd.to_datetime(r["date"]).year
+        year = get_financial_year(r["date"])   # <--- changed here
         if ticker not in pos:
             pos[ticker] = {"qty": 0.0, "cost": 0.0}
         if side == "buy":
@@ -388,26 +400,26 @@ def compute_nifty_yearly_returns(years, first_trade=None):
     today = pd.Timestamp(datetime.date.today())
     min_year = min(years)
     max_year = max(years)
-    start_all = pd.Timestamp(datetime.date(min_year, 1, 1)) - pd.Timedelta(days=10)
-    end_all = min(pd.Timestamp(datetime.date(max_year, 12, 31)), today) + pd.Timedelta(days=1)
+    start_all = pd.Timestamp(datetime.date(min_year, 4, 1)) - pd.Timedelta(days=10)
+    end_all = min(pd.Timestamp(datetime.date(max_year + 1, 3, 31)), today) + pd.Timedelta(days=1)
     hist = yf.Ticker("^NSEI").history(start=start_all.strftime("%Y-%m-%d"), end=end_all.strftime("%Y-%m-%d"))
     if hist is None or hist.empty:
         return {}
     closes = hist["Close"]
-    # Make closes index timezone-naive
     closes.index = closes.index.tz_localize(None)
     out = {}
     for i, year in enumerate(sorted(years)):
-        # For the first year, start with first_trade date
+        # For the first year, start with first_trade date if present, else April 1
         if i == 0 and first_trade is not None:
             start_dt = pd.Timestamp(first_trade).tz_localize(None)
+            if start_dt.month < 4 or start_dt.year != year:
+                start_dt = pd.Timestamp(datetime.date(year, 4, 1)).tz_localize(None)
         else:
-            start_dt = pd.Timestamp(datetime.date(year, 1, 1)).tz_localize(None)
-        if year == today.year:
+            start_dt = pd.Timestamp(datetime.date(year, 4, 1)).tz_localize(None)
+        if year + 1 == today.year and today < pd.Timestamp(datetime.date(today.year, 3, 31)):
             end_dt = today.tz_localize(None)
         else:
-            end_dt = pd.Timestamp(datetime.date(year, 12, 31)).tz_localize(None)
-        # Get last close on or before start
+            end_dt = pd.Timestamp(datetime.date(year + 1, 3, 31)).tz_localize(None)
         start_prices = closes[closes.index <= start_dt]
         end_prices = closes[closes.index <= end_dt]
         if not start_prices.empty and not end_prices.empty:
@@ -691,15 +703,16 @@ with tabs[1]:
         
         chart_rows = []
         for yr in years_list:
+            year_label = format_fin_year(yr)
             port_row = per_year_df[per_year_df["year"] == yr]
             port_val = port_row.iloc[0]["return_pct"] if not port_row.empty else None
             nifty_val = nifty_map.get(yr, None)
             chart_rows.append({
-                "year": yr, "series": "Portfolio",
+                "year": year_label, "series": "Portfolio",
                 "return_pct": float(port_val) if port_val is not None and not pd.isna(port_val) else np.nan
             })
             chart_rows.append({
-                "year": yr, "series": "Nifty 50 (^NSEI)",
+                "year": year_label, "series": "Nifty 50 (^NSEI)",
                 "return_pct": float(nifty_val) if nifty_val is not None and not pd.isna(nifty_val) else np.nan
             })
 
@@ -709,12 +722,12 @@ with tabs[1]:
 
         if not chart_df.empty:
             bars = alt.Chart(chart_df).mark_bar().encode(
-                x=alt.X("year:O", title="Year", sort=sorted(chart_df["year"].unique())),
+                x=alt.X("year:O", title="Financial Year", sort=sorted(chart_df["year"].unique())),
                 y=alt.Y("return_pct:Q", title="Return %"),
                 color=alt.Color("series:N", title="Series"),
                 xOffset=alt.XOffset("series:N"),
                 tooltip=[
-                    alt.Tooltip("year:O", title="Year"),
+                    alt.Tooltip("year:O", title="Financial Year"),
                     alt.Tooltip("series:N", title="Series"),
                     alt.Tooltip("return_pct:Q", title="Return %", format=".2f"),
                 ],
@@ -748,10 +761,11 @@ with tabs[1]:
         # Data table under the chart: includes both Portfolio and Nifty returns for each year
         display_rows = []
         for yr in years_list:
+            year_label = format_fin_year(yr)
             port_row = per_year_df[per_year_df["year"] == yr]
             nifty_val = nifty_map.get(yr, None)
             display_rows.append({
-                "Year": int(yr),
+                "Financial Year": year_label,
                 "BMV": inr_format(port_row.iloc[0]["BMV"]) if not port_row.empty else "N/A",
                 "EMV": inr_format(port_row.iloc[0]["EMV"]) if not port_row.empty else "N/A",
                 "Net Flows (₹)": inr_format(port_row.iloc[0]["net_flows"]) if not port_row.empty else "N/A",
