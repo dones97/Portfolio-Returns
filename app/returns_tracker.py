@@ -24,40 +24,39 @@ def get_financial_year(dt):
 def format_fin_year(y):
     return f"{y}-{str(y+1)[-2:]}"
 
-# --- Sharpe Ratio Utilities (Monthly Returns) ---
+# --- Sharpe Ratio Utilities (Annual Returns) ---
 
-def get_monthly_returns_from_pnl(pnl_ts):
+def get_annual_returns_from_pnl(pnl_ts):
     # Assumes pnl_ts has 'date' and 'total_pnl'
     df = pnl_ts.copy()
     df = df.sort_values('date').set_index('date')
-    df = df.resample('M').last().dropna()
-    df['monthly_return'] = df['total_pnl'].pct_change()
-    return df['monthly_return'].dropna()
+    df = df.resample('A').last().dropna()
+    df['annual_return'] = df['total_pnl'].pct_change()
+    return df['annual_return'].dropna()
 
-def get_monthly_returns_from_prices(prices):
-    # prices: Series with DateTimeIndex
+def get_annual_returns_from_prices(prices):
     prices = prices.sort_index()
-    monthly_prices = prices.resample('M').last().dropna()
-    monthly_returns = monthly_prices.pct_change().dropna()
-    return monthly_returns
+    annual_prices = prices.resample('A').last().dropna()
+    annual_returns = annual_prices.pct_change().dropna()
+    return annual_returns
 
 def annualized_volatility(returns):
-    # Monthly returns to annualized stddev
-    return returns.std(ddof=0) * (12 ** 0.5)
+    # If annual returns, stddev is already annualized
+    return returns.std(ddof=0)
 
 def annualized_return(returns):
-    # CAGR from monthly returns
-    n_months = len(returns)
-    if n_months == 0:
+    # CAGR from annual returns
+    n_years = len(returns)
+    if n_years == 0:
         return None
     total_return = (1 + returns).prod() - 1
-    years = n_months / 12
+    years = n_years
     if years == 0:
         return None
     return (1 + total_return) ** (1 / years) - 1
 
 def sharpe_ratio(returns, risk_free_rate_annual=0.065):
-    # returns: pd.Series of monthly returns
+    # returns: pd.Series of annual returns
     ann_ret = annualized_return(returns)
     ann_vol = annualized_volatility(returns)
     if ann_ret is None or ann_vol is None or ann_vol < 1e-9:
@@ -687,15 +686,15 @@ with tabs[1]:
     except Exception:
         nifty_cagr_val = None
 
-    # --- Sharpe/Stddev headline metrics (Monthly Returns) ---
+    # --- Sharpe/Stddev headline metrics (Annual Returns) ---
     pnl_ts = pnl_over_time(history_df)
     riskfree = 0.065
 
-    # Portfolio monthly returns
-    portfolio_monthly = get_monthly_returns_from_pnl(pnl_ts) if not pnl_ts.empty else pd.Series(dtype=float)
-    port_ann_ret, port_ann_vol, port_sharpe = sharpe_ratio(portfolio_monthly, risk_free_rate_annual=riskfree)
+    # Portfolio annual returns
+    portfolio_annual = get_annual_returns_from_pnl(pnl_ts) if not pnl_ts.empty else pd.Series(dtype=float)
+    port_ann_ret, port_ann_vol, port_sharpe = sharpe_ratio(portfolio_annual, risk_free_rate_annual=riskfree)
 
-    # Nifty 50 monthly returns for same period
+    # Nifty 50 annual returns for same period
     first_trade_dt = pd.to_datetime(history_df["date"].min())
     last_trade_dt = pd.to_datetime(history_df["date"].max())
     nifty_hist = yf.Ticker("^NSEI").history(
@@ -703,8 +702,8 @@ with tabs[1]:
         end=(last_trade_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     )
     nifty_hist.index = nifty_hist.index.tz_localize(None)
-    nifty_monthly = get_monthly_returns_from_prices(nifty_hist["Close"])
-    nifty_ann_ret, nifty_ann_vol, nifty_sharpe = sharpe_ratio(nifty_monthly, risk_free_rate_annual=riskfree)
+    nifty_annual = get_annual_returns_from_prices(nifty_hist["Close"])
+    nifty_ann_ret, nifty_ann_vol, nifty_sharpe = sharpe_ratio(nifty_annual, risk_free_rate_annual=riskfree)
 
     st.subheader("Portfolio Headline Performance")
     c1, c2, c3 = st.columns([1.2, 1, 1])
@@ -846,7 +845,7 @@ with tabs[1]:
 
         st.markdown("---")
 
-        # --- Yearly Sharpe Ratio Calculation & Chart (Monthly Returns) ---
+        # --- Yearly Sharpe Ratio Calculation & Chart (Annual Returns) ---
         st.subheader("Portfolio vs Nifty 50: Yearly Sharpe Ratio Comparison")
         def get_finyear_mask(df, yr):
             # Dates in financial year: Apr 1 (yr) to Mar 31 (yr+1)
@@ -857,22 +856,22 @@ with tabs[1]:
         yearly_sharpe_rows = []
         if not pnl_ts.empty and not nifty_hist.empty:
             pnl_ts_dtidx = pnl_ts.set_index('date')
-            nifty_mo = get_monthly_returns_from_prices(nifty_hist["Close"])
+            nifty_ann = get_annual_returns_from_prices(nifty_hist["Close"])
             for yr in years_list:
                 # Portfolio
                 mask = get_finyear_mask(pnl_ts_dtidx, yr)
-                port_monthly = get_monthly_returns_from_pnl(
+                port_annual = get_annual_returns_from_pnl(
                     pnl_ts[pnl_ts['date'].between(
                         pd.Timestamp(datetime.date(yr,4,1)),
                         pd.Timestamp(datetime.date(yr+1,3,31))
                     )]
                 )
-                _, _, port_sharpe_y = sharpe_ratio(port_monthly, risk_free_rate_annual=riskfree)
+                _, _, port_sharpe_y = sharpe_ratio(port_annual, risk_free_rate_annual=riskfree)
                 # Nifty
-                mask_nifty = get_finyear_mask(nifty_mo, yr)
+                mask_nifty = get_finyear_mask(nifty_ann, yr)
                 nifty_sharpe_y = None
-                if not nifty_mo[mask_nifty].empty:
-                    _, _, nifty_sharpe_y = sharpe_ratio(nifty_mo[mask_nifty], risk_free_rate_annual=riskfree)
+                if not nifty_ann[mask_nifty].empty:
+                    _, _, nifty_sharpe_y = sharpe_ratio(nifty_ann[mask_nifty], risk_free_rate_annual=riskfree)
                 yearly_sharpe_rows.append({
                     "year": format_fin_year(yr),
                     "series": "Portfolio",
