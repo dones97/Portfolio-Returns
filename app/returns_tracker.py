@@ -24,6 +24,48 @@ def get_financial_year(dt):
 def format_fin_year(y):
     return f"{y}-{str(y+1)[-2:]}"
 
+# --- Sharpe Ratio Utilities ---
+
+def get_weekly_returns_from_pnl(pnl_ts):
+    # Assumes pnl_ts has 'date' and 'total_pnl'
+    df = pnl_ts.copy()
+    df = df.sort_values('date').set_index('date')
+    df = df.resample('W').last().dropna()
+    df['weekly_return'] = df['total_pnl'].pct_change()
+    return df['weekly_return'].dropna()
+
+def get_weekly_returns_from_prices(prices):
+    # prices: Series with DateTimeIndex
+    prices = prices.sort_index()
+    weekly_prices = prices.resample('W').last().dropna()
+    weekly_returns = weekly_prices.pct_change().dropna()
+    return weekly_returns
+
+def annualized_volatility(returns):
+    # Weekly returns to annualized stddev
+    return returns.std(ddof=0) * (52 ** 0.5)
+
+def annualized_return(returns):
+    # CAGR from weekly returns
+    n_weeks = len(returns)
+    if n_weeks == 0:
+        return None
+    total_return = (1 + returns).prod() - 1
+    years = n_weeks / 52
+    if years == 0:
+        return None
+    return (1 + total_return) ** (1 / years) - 1
+
+def sharpe_ratio(returns, risk_free_rate_annual=0.065):
+    # returns: pd.Series of weekly returns
+    ann_ret = annualized_return(returns)
+    ann_vol = annualized_volatility(returns)
+    if ann_ret is None or ann_vol is None or ann_vol < 1e-9:
+        return None, None, None
+    excess = ann_ret - risk_free_rate_annual
+    sharpe = excess / ann_vol
+    return ann_ret, ann_vol, sharpe
+
 # --- TICKER MAPPING / IO ---
 
 def load_user_mappings():
@@ -656,6 +698,25 @@ with tabs[1]:
     except Exception:
         nifty_cagr_val = None
 
+    # --- Sharpe/Stddev headline metrics ---
+    pnl_ts = pnl_over_time(history_df)
+    riskfree = 0.065
+
+    # Portfolio weekly returns
+    portfolio_weekly = get_weekly_returns_from_pnl(pnl_ts) if not pnl_ts.empty else pd.Series(dtype=float)
+    port_ann_ret, port_ann_vol, port_sharpe = sharpe_ratio(portfolio_weekly, risk_free_rate_annual=riskfree)
+
+    # Nifty 50 weekly returns for same period
+    first_trade_dt = pd.to_datetime(history_df["date"].min())
+    last_trade_dt = pd.to_datetime(history_df["date"].max())
+    nifty_hist = yf.Ticker("^NSEI").history(
+        start=first_trade_dt.strftime("%Y-%m-%d"),
+        end=(last_trade_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    )
+    nifty_hist.index = nifty_hist.index.tz_localize(None)
+    nifty_weekly = get_weekly_returns_from_prices(nifty_hist["Close"])
+    nifty_ann_ret, nifty_ann_vol, nifty_sharpe = sharpe_ratio(nifty_weekly, risk_free_rate_annual=riskfree)
+
     st.subheader("Portfolio Headline Performance")
     c1, c2, c3 = st.columns([1.2, 1, 1])
     with c1:
@@ -667,6 +728,17 @@ with tabs[1]:
     with c3:
         st.markdown("**Nifty 50 CAGR (period)**")
         st.markdown(color_pct_html(nifty_cagr_val) if nifty_cagr_val is not None else "<span style='color:gray;'>N/A</span>", unsafe_allow_html=True)
+
+    # --- NEW: Display Portfolio Stddev, Sharpe, Nifty Sharpe ---
+    st.markdown("**Risk/Sharpe Metrics**")
+    st.markdown(
+        f"""
+        - Portfolio Stddev (annual): <b>{round(port_ann_vol*100,2) if port_ann_vol is not None else 'N/A'}%</b>
+        - Portfolio Sharpe: <b>{round(port_sharpe, 2) if port_sharpe is not None else 'N/A'}</b>
+        - Nifty 50 Sharpe: <b>{round(nifty_sharpe, 2) if nifty_sharpe is not None else 'N/A'}</b>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown("---")
     st.subheader("Total Return & Split")
@@ -783,12 +855,78 @@ with tabs[1]:
             st.warning("Used last trade price fallback when Yahoo historical prices were missing for some tickers/dates.")
             st.write(sorted(list(set(missing_prices)))[:20])
 
+        st.markdown("---")
+
+        # --- Yearly Sharpe Ratio Calculation & Chart ---
+        st.subheader("Portfolio vs Nifty 50: Yearly Sharpe Ratio Comparison")
+        def get_finyear_mask(df, yr):
+            # Dates in financial year: Apr 1 (yr) to Mar 31 (yr+1)
+            start = pd.Timestamp(datetime.date(yr, 4, 1))
+            end = pd.Timestamp(datetime.date(yr + 1, 3, 31))
+            return (df.index >= start) & (df.index <= end)
+
+        yearly_sharpe_rows = []
+        if not pnl_ts.empty and not nifty_hist.empty:
+            pnl_ts_dtidx = pnl_ts.set_index('date')
+            nifty_wk = get_weekly_returns_from_prices(nifty_hist["Close"])
+            for yr in years_list:
+                # Portfolio
+                mask = get_finyear_mask(pnl_ts_dtidx, yr)
+                port_weekly = get_weekly_returns_from_pnl(
+                    pnl_ts[pnl_ts['date'].between(
+                        pd.Timestamp(datetime.date(yr,4,1)),
+                        pd.Timestamp(datetime.date(yr+1,3,31))
+                    )]
+                )
+                _, _, port_sharpe_y = sharpe_ratio(port_weekly, risk_free_rate_annual=riskfree)
+                # Nifty
+                mask_nifty = get_finyear_mask(nifty_wk, yr)
+                nifty_sharpe_y = None
+                if not nifty_wk[mask_nifty].empty:
+                    _, _, nifty_sharpe_y = sharpe_ratio(nifty_wk[mask_nifty], risk_free_rate_annual=riskfree)
+                yearly_sharpe_rows.append({
+                    "year": format_fin_year(yr),
+                    "series": "Portfolio",
+                    "sharpe": port_sharpe_y if port_sharpe_y is not None else np.nan
+                })
+                yearly_sharpe_rows.append({
+                    "year": format_fin_year(yr),
+                    "series": "Nifty 50",
+                    "sharpe": nifty_sharpe_y if nifty_sharpe_y is not None else np.nan
+                })
+        sharpe_chart_df = pd.DataFrame(yearly_sharpe_rows).dropna(subset=["sharpe"])
+        sharpe_chart_df["label"] = sharpe_chart_df["sharpe"].round(2).astype(str)
+
+        if not sharpe_chart_df.empty:
+            bars = alt.Chart(sharpe_chart_df).mark_bar().encode(
+                x=alt.X("year:O", title="Financial Year", sort=sorted(sharpe_chart_df["year"].unique())),
+                y=alt.Y("sharpe:Q", title="Sharpe Ratio"),
+                color=alt.Color("series:N", title="Series"),
+                xOffset=alt.XOffset("series:N"),
+                tooltip=[
+                    alt.Tooltip("year:O", title="Financial Year"),
+                    alt.Tooltip("series:N", title="Series"),
+                    alt.Tooltip("sharpe:Q", title="Sharpe Ratio", format=".2f"),
+                ],
+            )
+            text = alt.Chart(sharpe_chart_df).mark_text(
+                dy=-10, fontSize=13, color="black"
+            ).encode(
+                x=alt.X("year:O", sort=sorted(sharpe_chart_df["year"].unique())),
+                y=alt.Y("sharpe:Q"),
+                text=alt.Text("label:N"),
+                xOffset=alt.XOffset("series:N"),
+            )
+            chart = (bars + text).properties(height=420)
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("No yearly sharpe ratios available to plot.")
+
     st.markdown("---")
     
     # --- Cumulative portfolio profit over time (Total = realized + unrealized estimate) ---
     st.subheader("Cumulative Portfolio Profit Over Time (INR)")
 
-    pnl_ts = pnl_over_time(history_df)
     if pnl_ts.empty:
         st.info("No trades found to build profit timeline.")
     else:
