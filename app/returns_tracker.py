@@ -57,16 +57,21 @@ def compute_monthly_twr(history_df, price_lookup=None):
     cf = df[["date", "side", "quantity", "price", "yahoo_ticker"]].copy()
     cf["amount"] = cf["quantity"].astype(float) * cf["price"].astype(float)
     cf = cf.sort_values("date")
+
     all_dates = pd.date_range(df["date"].min().replace(day=1), df["date"].max(), freq="M")
     if not all_dates.empty and all_dates[-1] < df["date"].max():
         all_dates = all_dates.append(pd.DatetimeIndex([df["date"].max()]))
     if all_dates.empty:
         return pd.Series(dtype=float)
+
     monthly_returns = []
     holdings = {}
+
     for i, period_end in enumerate(all_dates):
         period_start = all_dates[i-1] + pd.Timedelta(days=1) if i > 0 else df["date"].min().replace(day=1)
         cf_period = cf[(cf["date"] >= period_start) & (cf["date"] <= period_end)].copy()
+
+        # Initialize positions before the first period, using all earlier trades
         if i == 0:
             df_pri = df[df["date"] < period_start]
             for _, r in df_pri.iterrows():
@@ -88,6 +93,8 @@ def compute_monthly_twr(history_df, price_lookup=None):
                         if holdings[t]["qty"] < 1e-6:
                             holdings[t]["qty"] = 0.0
                             holdings[t]["cost"] = 0.0
+
+        # Value at start
         period_start_val = 0.0
         for t, h in holdings.items():
             qty = h["qty"]
@@ -96,10 +103,12 @@ def compute_monthly_twr(history_df, price_lookup=None):
                     price = price_lookup(t, period_start)
                 else:
                     price = np.nan
-                if (price is None) or (isinstance(price, float) and np.isnan(price)):
+                if pd.isna(price):
                     last_trade = df[(df["yahoo_ticker"] == t) & (df["date"] <= period_start)]
                     price = float(last_trade.iloc[-1]["price"]) if not last_trade.empty else 0.0
-                period_start_val += qty * price
+                period_start_val += qty * float(price)
+
+        # Apply trades within the period to positions (cashflows handled later)
         for _, r in cf_period.iterrows():
             t = r["yahoo_ticker"]
             q = float(r["quantity"])
@@ -113,12 +122,14 @@ def compute_monthly_twr(history_df, price_lookup=None):
             elif s.startswith("sell"):
                 prev_qty = holdings[t]["qty"]
                 if prev_qty > 0:
-                    avg_cost = holdings[t]["cost"] / prev_qty
+                    avg_cost = holdings[t]["cost"] / prev_qty if prev_qty > 0 else 0.0
                     holdings[t]["qty"] -= q
                     holdings[t]["cost"] -= avg_cost * q
                     if holdings[t]["qty"] < 1e-6:
                         holdings[t]["qty"] = 0.0
                         holdings[t]["cost"] = 0.0
+
+        # Value at end
         period_end_val = 0.0
         for t, h in holdings.items():
             qty = h["qty"]
@@ -127,10 +138,12 @@ def compute_monthly_twr(history_df, price_lookup=None):
                     price = price_lookup(t, period_end)
                 else:
                     price = np.nan
-                if (price is None) or (isinstance(price, float) and np.isnan(price)):
+                if pd.isna(price):
                     last_trade = df[(df["yahoo_ticker"] == t) & (df["date"] <= period_end)]
                     price = float(last_trade.iloc[-1]["price"]) if not last_trade.empty else 0.0
-                period_end_val += qty * price
+                period_end_val += qty * float(price)
+
+        # Net cashflow during period (buys negative, sells positive)
         net_cf = 0.0
         for _, r in cf_period.iterrows():
             amt = float(r["amount"])
@@ -139,6 +152,8 @@ def compute_monthly_twr(history_df, price_lookup=None):
                 net_cf -= amt
             else:
                 net_cf += amt
+
+        # TWR return for the period
         if period_start_val + abs(net_cf) < 1e-6:
             ret = 0.0
         else:
@@ -146,8 +161,11 @@ def compute_monthly_twr(history_df, price_lookup=None):
                 ret = (period_end_val - period_start_val - net_cf) / period_start_val
             else:
                 ret = 0.0
+
         monthly_returns.append({"period_end": period_end, "return": ret})
-    monthly_twr = pd.Series([x["return"] for x in monthly_returns], index=[x["period_end"] for x in monthly_returns])
+
+    monthly_twr = pd.Series([x["return"] for x in monthly_returns],
+                            index=[x["period_end"] for x in monthly_returns])
     return monthly_twr
 
 # --- Sharpe/Volatility utilities, annualized from monthly returns ---
@@ -176,9 +194,7 @@ def sharpe_ratio(returns, risk_free_rate_annual=0.065):
 # --- NEW HELPERS TO FIX NAME ERRORS ---
 
 def get_monthly_returns_from_prices(close_series: pd.Series) -> pd.Series:
-    """
-    From a price series (DateTimeIndex), compute end-of-month simple returns.
-    """
+    """From a price series (DateTimeIndex), compute end-of-month simple returns."""
     if close_series is None or len(close_series) == 0:
         return pd.Series(dtype=float)
     s = close_series.copy()
@@ -190,9 +206,7 @@ def get_monthly_returns_from_prices(close_series: pd.Series) -> pd.Series:
     return rets
 
 def _portfolio_value_on_date(history_df: pd.DataFrame, dt: pd.Timestamp) -> float:
-    """
-    Compute portfolio market value at a specific date using last available price <= dt.
-    """
+    """Compute portfolio market value at a specific date using last available price <= dt."""
     df = history_df.copy()
     df["date"] = pd.to_datetime(df["date"])
     df = df[df["date"] <= dt]
@@ -213,17 +227,13 @@ def _portfolio_value_on_date(history_df: pd.DataFrame, dt: pd.Timestamp) -> floa
         if qty > 0:
             px = get_prev_trading_price(t, dt)
             if px is None:
-                # fallback to last trade price
                 last_trade = df[df["yahoo_ticker"] == t]
                 px = float(last_trade.iloc[-1]["price"]) if not last_trade.empty else 0.0
             mv += qty * float(px)
     return float(mv)
 
 def compute_yearly_metrics_from_trades(history_df: pd.DataFrame):
-    """
-    Build minimal per-financial-year metrics used by your table/chart block.
-    Returns (per_year_results, missing_prices_list).
-    """
+    """Build minimal per-financial-year metrics used by your table/chart block."""
     df = history_df.copy()
     df["date"] = pd.to_datetime(df["date"])
     years = sorted(df["date"].apply(get_financial_year).unique())
@@ -234,11 +244,9 @@ def compute_yearly_metrics_from_trades(history_df: pd.DataFrame):
         start = pd.Timestamp(datetime.date(yr, 4, 1))
         end = pd.Timestamp(datetime.date(yr + 1, 3, 31))
 
-        # Beginning and Ending Market Values
         BMV = _portfolio_value_on_date(df, start)
         EMV = _portfolio_value_on_date(df, end)
 
-        # Net flows within the FY (buys negative, sells positive)
         mask = (df["date"] >= start) & (df["date"] <= end)
         df_yr = df[mask]
         net_flows = 0.0
@@ -252,7 +260,6 @@ def compute_yearly_metrics_from_trades(history_df: pd.DataFrame):
         total_return_amt = EMV - BMV - net_flows
         return_pct = (total_return_amt / BMV * 100.0) if BMV > 0 else np.nan
 
-        # Approx realized/unrealized placeholders (simple, consistent with available info)
         realized_amt = df_yr[df_yr["side"].str.lower().str.startswith("sell")]
         realized_amt = (realized_amt["quantity"].astype(float) * realized_amt["price"].astype(float)).sum()
         realized_amt = float(realized_amt) if not np.isnan(realized_amt) else 0.0
@@ -267,15 +274,13 @@ def compute_yearly_metrics_from_trades(history_df: pd.DataFrame):
             "total_return_amt": total_return_amt,
             "return_pct": return_pct,
             "realized_amt": realized_amt,
-            "unrealized_amt": EMV - max(0.0, avg_portfolio_val - net_flows),  # rough placeholder
+            "unrealized_amt": EMV - max(0.0, avg_portfolio_val - net_flows),  # placeholder
             "avg_portfolio_val": avg_portfolio_val
         })
     return results, missing
 
 def compute_nifty_yearly_returns(years_list, first_trade):
-    """
-    Map {financial_year -> Nifty return % for that FY} over the trade period.
-    """
+    """Map {financial_year -> Nifty return % for that FY} over the trade period."""
     if first_trade is None or pd.isna(first_trade):
         return {}
     first_trade = pd.to_datetime(first_trade)
@@ -289,7 +294,6 @@ def compute_nifty_yearly_returns(years_list, first_trade):
             return {}
         nifty_hist.index = nifty_hist.index.tz_localize(None)
         monthly = get_monthly_returns_from_prices(nifty_hist["Close"])
-        # Compound within each FY
         df = monthly.to_frame("ret")
         df["fin_year"] = df.index.to_series().apply(get_financial_year)
         fy_map = {}
@@ -298,7 +302,6 @@ def compute_nifty_yearly_returns(years_list, first_trade):
                 continue
             cum = (1 + grp["ret"]).prod() - 1
             fy_map[int(y)] = float(cum * 100.0)
-        # keep only requested years
         return {int(y): fy_map.get(int(y), np.nan) for y in years_list}
     except Exception:
         return {}
@@ -819,7 +822,6 @@ with tabs[1]:
                 ],
             )
         
-            # Overlay positive labels in green
             text_pos = alt.Chart(chart_df[chart_df["return_pct"] >= 0]).mark_text(
                 dy=-10, fontSize=13, color="green"
             ).encode(
@@ -829,7 +831,6 @@ with tabs[1]:
                 xOffset=alt.XOffset("series:N"),
             )
         
-            # Overlay negative labels in red
             text_neg = alt.Chart(chart_df[chart_df["return_pct"] < 0]).mark_text(
                 dy=12, fontSize=13, color="red"
             ).encode(
@@ -844,7 +845,7 @@ with tabs[1]:
         else:
             st.info("No yearly returns available to plot.")
     
-        # Data table under the chart: includes both Portfolio and Nifty returns for each year
+        # Data table under the chart
         display_rows = []
         for yr in years_list:
             year_label = format_fin_year(yr)
@@ -881,7 +882,6 @@ with tabs[1]:
 
         yearly_sharpe_rows = []
         if (portfolio_monthly_twr is not None) and (not portfolio_monthly_twr.empty) and (not nifty_hist.empty):
-            # Normalize indices to month-end timestamps
             port_m = pd.Series(portfolio_monthly_twr.values.astype(float),
                                index=pd.to_datetime(portfolio_monthly_twr.index)).copy()
             port_m.index = port_m.index.to_period('M').to_timestamp('M')
@@ -889,12 +889,10 @@ with tabs[1]:
             nifty_mo = get_monthly_returns_from_prices(nifty_hist["Close"])
 
             for yr in years_list:
-                # Portfolio FY mask
                 mask_port = get_finyear_mask(port_m.index, yr)
                 port_slice = port_m[mask_port]
                 _, _, port_sharpe_y = sharpe_ratio(port_slice, risk_free_rate_annual=riskfree)
 
-                # Nifty FY mask
                 mask_nifty = get_finyear_mask(nifty_mo.index, yr)
                 nifty_slice = nifty_mo[mask_nifty]
                 _, _, nifty_sharpe_y = sharpe_ratio(nifty_slice, risk_free_rate_annual=riskfree) if not nifty_slice.empty else (None, None, None)
@@ -981,7 +979,6 @@ with tabs[1]:
             ]
         )
 
-        # Nifty 50 comparison line WITH LEGEND
         trade_dates = pnl_ts["date"].sort_values().unique()
         first_trade_dt = pd.to_datetime(history_df["date"].min())
         last_trade_dt = pd.to_datetime(history_df["date"].max())
@@ -1024,7 +1021,6 @@ with tabs[1]:
                     "series": "Nifty 50 Simulated"
                 })
 
-            # Combine for legend
             nifty_pnl_df = pd.DataFrame(nifty_pnl_rows)
             if not nifty_pnl_df.empty:
                 chart_area = alt.Chart(area_data).mark_area().encode(
@@ -1037,7 +1033,7 @@ with tabs[1]:
                     order=alt.Order('series', sort='ascending'),
                     opacity=alt.condition(
                         alt.datum.series == "Nifty 50 Simulated",
-                        alt.value(0),  # Don't show area for Nifty
+                        alt.value(0),
                         alt.value(0.7)
                     ),
                     tooltip=[
@@ -1081,7 +1077,7 @@ with tabs[1]:
    
     st.markdown("---")
 
-    # --- Realized / Unrealized tables (no styled variants) ---
+    # --- Realized / Unrealized tables ---
     st.subheader("Realized Returns (Average Costing)")
     if not realized_df.empty:
         rf = realized_df.copy()
@@ -1102,7 +1098,6 @@ with tabs[1]:
         uf["Profit/Loss Value INR"] = uf["Profit/Loss Value"].apply(lambda x: inr_format(x) if x != "N/A" else "N/A")
         uf["Average Buy Price INR"] = uf["Average Buy Price"].apply(inr_format)
         uf["Current Price INR"] = uf["Current Price"].apply(lambda x: inr_format(x) if x != "N/A" else "N/A")
-        # numeric for sorting
         def to_num(x):
             try:
                 return float(x)
