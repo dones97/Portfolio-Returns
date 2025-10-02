@@ -13,7 +13,6 @@ TRADE_REPORTS_DIR = "trade_reports"
 PORTFOLIO_HISTORY_CSV = "portfolio_history.csv"
 
 def get_financial_year(dt):
-    """Given a date, return the start year of the financial year (e.g., 2022 for FY 2022-23)."""
     dt = pd.to_datetime(dt)
     year = dt.year
     if dt.month < 4:
@@ -24,29 +23,139 @@ def get_financial_year(dt):
 def format_fin_year(y):
     return f"{y}-{str(y+1)[-2:]}"
 
-# --- Sharpe Ratio Utilities (Monthly Returns) ---
+# --- TWR Monthly Returns Utility ---
 
-def get_monthly_returns_from_pnl(pnl_ts):
-    # Assumes pnl_ts has 'date' and 'total_pnl'
-    df = pnl_ts.copy()
-    df = df.sort_values('date').set_index('date')
-    df = df.resample('M').last().dropna()
-    df['monthly_return'] = df['total_pnl'].pct_change()
-    return df['monthly_return'].dropna()
+_price_cache = {}
 
-def get_monthly_returns_from_prices(prices):
-    # prices: Series with DateTimeIndex
-    prices = prices.sort_index()
-    monthly_prices = prices.resample('M').last().dropna()
-    monthly_returns = monthly_prices.pct_change().dropna()
-    return monthly_returns
+def get_prev_trading_price(ticker, target_date):
+    if not isinstance(target_date, (pd.Timestamp, datetime.date, datetime.datetime)):
+        target_date = pd.to_datetime(target_date)
+    target_day = pd.Timestamp(target_date).normalize()
+    key = ("hist", ticker, target_day.strftime("%Y-%m-%d"))
+    if key in _price_cache:
+        return _price_cache[key]
+    start = (target_day - pd.Timedelta(days=40)).strftime("%Y-%m-%d")
+    end = (target_day + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        hist = yf.Ticker(ticker).history(start=start, end=end)
+        if hist is None or hist.empty:
+            _price_cache[key] = None
+            return None
+        hist = hist[hist.index <= target_day]
+        if hist.empty:
+            _price_cache[key] = None
+            return None
+        price = float(hist.iloc[-1]["Close"])
+        _price_cache[key] = price
+        return price
+    except Exception:
+        _price_cache[key] = None
+        return None
 
+def compute_monthly_twr(history_df, price_lookup=None):
+    df = history_df.copy().sort_values("date")
+    df["date"] = pd.to_datetime(df["date"])
+    cf = df[["date", "side", "quantity", "price", "yahoo_ticker"]].copy()
+    cf["amount"] = cf["quantity"].astype(float) * cf["price"].astype(float)
+    cf = cf.sort_values("date")
+    all_dates = pd.date_range(df["date"].min().replace(day=1), df["date"].max(), freq="M")
+    if not all_dates.empty and all_dates[-1] < df["date"].max():
+        all_dates = all_dates.append(pd.DatetimeIndex([df["date"].max()]))
+    if all_dates.empty:
+        return pd.Series(dtype=float)
+    monthly_returns = []
+    holdings = {}
+    for i, period_end in enumerate(all_dates):
+        period_start = all_dates[i-1] + pd.Timedelta(days=1) if i > 0 else df["date"].min().replace(day=1)
+        cf_period = cf[(cf["date"] >= period_start) & (cf["date"] <= period_end)].copy()
+        if i == 0:
+            df_pri = df[df["date"] < period_start]
+            for _, r in df_pri.iterrows():
+                t = r["yahoo_ticker"]
+                q = float(r["quantity"])
+                p = float(r["price"])
+                s = str(r["side"]).strip().lower()
+                if t not in holdings:
+                    holdings[t] = {"qty": 0.0, "cost": 0.0}
+                if s.startswith("buy"):
+                    holdings[t]["qty"] += q
+                    holdings[t]["cost"] += q * p
+                elif s.startswith("sell"):
+                    prev_qty = holdings[t]["qty"]
+                    if prev_qty > 0:
+                        avg_cost = holdings[t]["cost"] / prev_qty
+                        holdings[t]["qty"] -= q
+                        holdings[t]["cost"] -= avg_cost * q
+                        if holdings[t]["qty"] < 1e-6:
+                            holdings[t]["qty"] = 0.0
+                            holdings[t]["cost"] = 0.0
+        period_start_val = 0.0
+        for t, h in holdings.items():
+            qty = h["qty"]
+            if qty > 0:
+                if price_lookup:
+                    price = price_lookup(t, period_start)
+                else:
+                    price = np.nan
+                if np.isnan(price) or price is None:
+                    last_trade = df[(df["yahoo_ticker"] == t) & (df["date"] <= period_start)]
+                    price = float(last_trade.iloc[-1]["price"]) if not last_trade.empty else 0.0
+                period_start_val += qty * price
+        for _, r in cf_period.iterrows():
+            t = r["yahoo_ticker"]
+            q = float(r["quantity"])
+            p = float(r["price"])
+            s = str(r["side"]).strip().lower()
+            if t not in holdings:
+                holdings[t] = {"qty": 0.0, "cost": 0.0}
+            if s.startswith("buy"):
+                holdings[t]["qty"] += q
+                holdings[t]["cost"] += q * p
+            elif s.startswith("sell"):
+                prev_qty = holdings[t]["qty"]
+                if prev_qty > 0:
+                    avg_cost = holdings[t]["cost"] / prev_qty
+                    holdings[t]["qty"] -= q
+                    holdings[t]["cost"] -= avg_cost * q
+                    if holdings[t]["qty"] < 1e-6:
+                        holdings[t]["qty"] = 0.0
+                        holdings[t]["cost"] = 0.0
+        period_end_val = 0.0
+        for t, h in holdings.items():
+            qty = h["qty"]
+            if qty > 0:
+                if price_lookup:
+                    price = price_lookup(t, period_end)
+                else:
+                    price = np.nan
+                if np.isnan(price) or price is None:
+                    last_trade = df[(df["yahoo_ticker"] == t) & (df["date"] <= period_end)]
+                    price = float(last_trade.iloc[-1]["price"]) if not last_trade.empty else 0.0
+                period_end_val += qty * price
+        net_cf = 0.0
+        for _, r in cf_period.iterrows():
+            amt = float(r["amount"])
+            s = str(r["side"]).strip().lower()
+            if s.startswith("buy"):
+                net_cf -= amt
+            else:
+                net_cf += amt
+        if period_start_val + abs(net_cf) < 1e-6:
+            ret = 0.0
+        else:
+            if period_start_val > 0:
+                ret = (period_end_val - period_start_val - net_cf) / period_start_val
+            else:
+                ret = 0.0
+        monthly_returns.append({"period_end": period_end, "return": ret})
+    monthly_twr = pd.Series([x["return"] for x in monthly_returns], index=[x["period_end"] for x in monthly_returns])
+    return monthly_twr
+
+# --- Sharpe/Volatility utilities, annualized from monthly returns ---
 def annualized_volatility(returns):
-    # Monthly returns to annualized stddev
     return returns.std(ddof=0) * (12 ** 0.5)
 
 def annualized_return(returns):
-    # CAGR from monthly returns
     n_months = len(returns)
     if n_months == 0:
         return None
@@ -57,7 +166,6 @@ def annualized_return(returns):
     return (1 + total_return) ** (1 / years) - 1
 
 def sharpe_ratio(returns, risk_free_rate_annual=0.065):
-    # returns: pd.Series of monthly returns
     ann_ret = annualized_return(returns)
     ann_vol = annualized_volatility(returns)
     if ann_ret is None or ann_vol is None or ann_vol < 1e-9:
@@ -168,35 +276,6 @@ def color_pct_html(pct):
     color = "green" if pct >= 0 else "red"
     return f"<span style='color:{color}; font-weight:bold'>{round(pct,2)}%</span>"
 
-# --- PRICE LOOKUP (cached) ---
-_price_cache = {}
-
-def get_prev_trading_price(ticker, target_date):
-    if not isinstance(target_date, (pd.Timestamp, datetime.date, datetime.datetime)):
-        target_date = pd.to_datetime(target_date)
-    target_day = pd.Timestamp(target_date).normalize()
-    key = ("hist", ticker, target_day.strftime("%Y-%m-%d"))
-    if key in _price_cache:
-        return _price_cache[key]
-    # wider window for safety
-    start = (target_day - pd.Timedelta(days=40)).strftime("%Y-%m-%d")
-    end = (target_day + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    try:
-        hist = yf.Ticker(ticker).history(start=start, end=end)
-        if hist is None or hist.empty:
-            _price_cache[key] = None
-            return None
-        hist = hist[hist.index <= target_day]
-        if hist.empty:
-            _price_cache[key] = None
-            return None
-        price = float(hist.iloc[-1]["Close"])
-        _price_cache[key] = price
-        return price
-    except Exception:
-        _price_cache[key] = None
-        return None
-
 def get_current_price(ticker):
     key = ("cur", ticker)
     if key in _price_cache:
@@ -215,7 +294,7 @@ def get_current_price(ticker):
         _price_cache[key] = None
         return None
 
-# --- REALIZED / UNREALIZED (average-cost) ---
+# --- Realized / Unrealized (average-cost) ---
 def calc_realized_unrealized_avgcost(df):
     result_realized = []
     result_unrealized = []
@@ -272,7 +351,6 @@ def calc_realized_unrealized_avgcost(df):
 
     return realized_df, unrealized_df, total_realized, total_unrealized
 
-# --- XIRR cashflows ---
 def build_cashflows_from_history(history_df):
     cfs = []
     for _, r in history_df.sort_values("date").iterrows():
@@ -281,192 +359,14 @@ def build_cashflows_from_history(history_df):
         dt = pd.to_datetime(r["date"])
         amt = qty * price
         if str(r["side"]).strip().lower().startswith("buy"):
-            cfs.append((-amt, dt))  # investor outflow
+            cfs.append((-amt, dt))
         else:
-            cfs.append((amt, dt))   # inflow on sell
+            cfs.append((amt, dt))
     return cfs
 
-# --- Realized by year (avg-cost sim) ---
-def compute_realized_pl_by_year(history_df):
-    df = history_df.copy().sort_values("date")
-    realized_by_year = {}
-    pos = {}
-    for _, r in df.iterrows():
-        ticker = r.get("yahoo_ticker", "")
-        if not ticker or pd.isna(ticker):
-            continue
-        side = str(r["side"]).strip().lower()
-        qty = float(r["quantity"])
-        price = float(r["price"])
-        year = get_financial_year(r["date"])   # <--- changed here
-        if ticker not in pos:
-            pos[ticker] = {"qty": 0.0, "cost": 0.0}
-        if side == "buy":
-            pos[ticker]["qty"] += qty
-            pos[ticker]["cost"] += qty * price
-        else:
-            avg_cost = (pos[ticker]["cost"] / pos[ticker]["qty"]) if pos[ticker]["qty"] > 0 else 0.0
-            realized = qty * (price - avg_cost)
-            realized_by_year[year] = realized_by_year.get(year, 0.0) + realized
-            remaining_qty = pos[ticker]["qty"] - qty
-            if remaining_qty <= 0:
-                pos[ticker]["qty"] = 0.0
-                pos[ticker]["cost"] = 0.0
-            else:
-                pos[ticker]["qty"] = remaining_qty
-                pos[ticker]["cost"] = avg_cost * remaining_qty
-    return realized_by_year
-
-# --- Fallback price on a date: Yahoo -> last trade price ---
-def get_price_for_date_with_fallback(ticker, target_date, history_df):
-    price = get_prev_trading_price(ticker, target_date)
-    if price is not None:
-        return price, "yahoo"
-    if history_df is not None:
-        mask = (history_df["yahoo_ticker"] == ticker) & (history_df["date"] <= pd.to_datetime(target_date))
-        trades = history_df.loc[mask].sort_values("date")
-        if not trades.empty:
-            last_price = float(trades.iloc[-1]["price"])
-            return last_price, "last_trade"
-    return None, None
-
-# --- Calendar-year metrics from trades (robust) ---
-def compute_yearly_metrics_from_trades(history_df):
-    if history_df.empty:
-        return [], []
-
-    history_df = history_df.copy().sort_values("date")
-    history_df["date"] = pd.to_datetime(history_df["date"])
-    first_year = history_df["date"].dt.year.min()
-    last_year = history_df["date"].dt.year.max()
-    years = list(range(first_year, last_year + 1))
-
-    realized_by_year = compute_realized_pl_by_year(history_df)
-    missing_prices = []
-    results = []
-    today = pd.Timestamp(datetime.date.today())
-
-    def holdings_as_of(dt, inclusive=False):
-        if inclusive:
-            mask = history_df["date"] <= pd.to_datetime(dt)
-        else:
-            mask = history_df["date"] < pd.to_datetime(dt)
-        sub = history_df.loc[mask].dropna(subset=["yahoo_ticker"])
-        net = {}
-        for t, grp in sub.groupby("yahoo_ticker"):
-            buy_qty = grp[grp["side"].str.lower() == "buy"]["quantity"].astype(float).sum()
-            sell_qty = grp[grp["side"].str.lower() == "sell"]["quantity"].astype(float).sum()
-            net[t] = buy_qty - sell_qty
-        return net
-
-    for y in years:
-        start_dt = pd.Timestamp(datetime.date(y, 1, 1))
-        end_dt = pd.Timestamp(datetime.date(y, 12, 31))
-        end_eff = min(end_dt, today)
-
-        b_hold = holdings_as_of(start_dt, inclusive=False)
-        e_hold = holdings_as_of(end_eff, inclusive=True)
-
-        BMV = 0.0
-        EMV = 0.0
-
-        for t, qty in b_hold.items():
-            if qty == 0:
-                continue
-            price, _ = get_price_for_date_with_fallback(t, start_dt, history_df)
-            if price is None:
-                missing_prices.append((t, start_dt.date()))
-                continue
-            BMV += qty * price
-
-        for t, qty in e_hold.items():
-            if qty == 0:
-                continue
-            price, _ = get_price_for_date_with_fallback(t, end_eff, history_df)
-            if price is None:
-                missing_prices.append((t, end_eff.date()))
-                continue
-            EMV += qty * price
-
-        mask_year = (history_df["date"] >= start_dt) & (history_df["date"] <= end_eff)
-        df_year = history_df.loc[mask_year]
-        net_flows = 0.0
-        for _, r in df_year.iterrows():
-            amt = float(r["quantity"]) * float(r["price"])
-            if str(r["side"]).strip().lower().startswith("buy"):
-                net_flows += amt
-            else:
-                net_flows -= amt
-
-        if abs(net_flows) < 1e-9 and abs(BMV) < 1e-9 and abs(EMV) < 1e-9:
-            continue
-
-        total_return_amt = EMV - BMV - net_flows
-        avg_portfolio_val = (BMV + EMV) / 2.0 if (BMV + EMV) != 0 else None
-
-        if avg_portfolio_val and avg_portfolio_val > 0:
-            return_pct = (total_return_amt / avg_portfolio_val) * 100.0
-        elif net_flows > 0:
-            return_pct = (total_return_amt / net_flows) * 100.0
-        else:
-            return_pct = None
-
-        realized_amt = realized_by_year.get(y, 0.0)
-        unrealized_amt = total_return_amt - realized_amt
-
-        results.append({
-            "year": y,
-            "BMV": BMV,
-            "EMV": EMV,
-            "net_flows": net_flows,
-            "total_return_amt": total_return_amt,
-            "return_pct": return_pct,
-            "realized_amt": realized_amt,
-            "unrealized_amt": unrealized_amt,
-            "avg_portfolio_val": avg_portfolio_val
-        })
-
-    return results, missing_prices
-
-# --- Nifty 50 yearly returns for given years (single fetch; same index as headline: ^NSEI) ---
-def compute_nifty_yearly_returns(years, first_trade=None):
-    today = pd.Timestamp(datetime.date.today())
-    min_year = min(years)
-    max_year = max(years)
-    start_all = pd.Timestamp(datetime.date(min_year, 4, 1)) - pd.Timedelta(days=10)
-    end_all = min(pd.Timestamp(datetime.date(max_year + 1, 3, 31)), today) + pd.Timedelta(days=1)
-    hist = yf.Ticker("^NSEI").history(start=start_all.strftime("%Y-%m-%d"), end=end_all.strftime("%Y-%m-%d"))
-    if hist is None or hist.empty:
-        return {}
-    closes = hist["Close"]
-    closes.index = closes.index.tz_localize(None)
-    out = {}
-    for i, year in enumerate(sorted(years)):
-        # For the first year, start with first_trade date if present, else April 1
-        if i == 0 and first_trade is not None:
-            start_dt = pd.Timestamp(first_trade).tz_localize(None)
-            if start_dt.month < 4 or start_dt.year != year:
-                start_dt = pd.Timestamp(datetime.date(year, 4, 1)).tz_localize(None)
-        else:
-            start_dt = pd.Timestamp(datetime.date(year, 4, 1)).tz_localize(None)
-        if year + 1 == today.year and today < pd.Timestamp(datetime.date(today.year, 3, 31)):
-            end_dt = today.tz_localize(None)
-        else:
-            end_dt = pd.Timestamp(datetime.date(year + 1, 3, 31)).tz_localize(None)
-        start_prices = closes[closes.index <= start_dt]
-        end_prices = closes[closes.index <= end_dt]
-        if not start_prices.empty and not end_prices.empty:
-            start_val = start_prices.iloc[-1]
-            end_val = end_prices.iloc[-1]
-            out[year] = (end_val / start_val - 1.0) * 100.0
-        else:
-            out[year] = None
-    return out
-    
-# --- P&L timeline (cumulative total = realized + unrealized estimate using last trade prices) ---
 def pnl_over_time(history_df):
     df = history_df.copy().sort_values("date")
-    pos = {}  # ticker -> dict(qty, cost_sum, last_price)
+    pos = {}
     realized_cum = 0.0
     rows = []
 
@@ -618,7 +518,6 @@ with tabs[1]:
         st.error(f"portfolio_history.csv missing columns: {required_cols - set(history_df.columns)}")
         st.stop()
 
-    # Headline metrics
     realized_df, unrealized_df, total_realized, total_unrealized = calc_realized_unrealized_avgcost(history_df)
 
     curr_value = unrealized_df.apply(
@@ -650,7 +549,6 @@ with tabs[1]:
                 import numpy_financial as npf
                 irr_val = npf.xirr(amounts, dates) * 100.0
             except Exception:
-                # simple Newton fallback
                 d0 = pd.to_datetime(dates[0])
                 times = np.array([(pd.to_datetime(d) - d0).days / 365.0 for d in dates], dtype=float)
                 amts = np.array(amounts, dtype=float)
@@ -669,7 +567,6 @@ with tabs[1]:
         except Exception:
             irr_str = "<span style='color:gray;'>N/A</span>"
 
-    # Nifty 50 CAGR headline (same index we'll use for yearly)
     first_trade = history_df["date"].min()
     last_trade = history_df["date"].max()
     nifty_cagr_val = None
@@ -687,15 +584,11 @@ with tabs[1]:
     except Exception:
         nifty_cagr_val = None
 
-    # --- Sharpe/Stddev headline metrics (Monthly Returns) ---
-    pnl_ts = pnl_over_time(history_df)
     riskfree = 0.065
+    pnl_ts = pnl_over_time(history_df)
+    portfolio_monthly_twr = compute_monthly_twr(history_df, price_lookup=get_prev_trading_price)
+    port_ann_ret, port_ann_vol, port_sharpe = sharpe_ratio(portfolio_monthly_twr, risk_free_rate_annual=riskfree)
 
-    # Portfolio monthly returns
-    portfolio_monthly = get_monthly_returns_from_pnl(pnl_ts) if not pnl_ts.empty else pd.Series(dtype=float)
-    port_ann_ret, port_ann_vol, port_sharpe = sharpe_ratio(portfolio_monthly, risk_free_rate_annual=riskfree)
-
-    # Nifty 50 monthly returns for same period
     first_trade_dt = pd.to_datetime(history_df["date"].min())
     last_trade_dt = pd.to_datetime(history_df["date"].max())
     nifty_hist = yf.Ticker("^NSEI").history(
@@ -703,7 +596,7 @@ with tabs[1]:
         end=(last_trade_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     )
     nifty_hist.index = nifty_hist.index.tz_localize(None)
-    nifty_monthly = get_monthly_returns_from_prices(nifty_hist["Close"])
+    nifty_monthly = nifty_hist["Close"].sort_index().resample('M').last().pct_change().dropna()
     nifty_ann_ret, nifty_ann_vol, nifty_sharpe = sharpe_ratio(nifty_monthly, risk_free_rate_annual=riskfree)
 
     st.subheader("Portfolio Headline Performance")
@@ -718,7 +611,6 @@ with tabs[1]:
         st.markdown("**Nifty 50 CAGR (period)**")
         st.markdown(color_pct_html(nifty_cagr_val) if nifty_cagr_val is not None else "<span style='color:gray;'>N/A</span>", unsafe_allow_html=True)
 
-    # --- NEW: Display Portfolio Stddev, Sharpe, Nifty Sharpe ---
     st.markdown("**Risk/Sharpe Metrics**")
     st.markdown(
         f"""
