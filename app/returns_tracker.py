@@ -24,7 +24,6 @@ def format_fin_year(y):
     return f"{y}-{str(y+1)[-2:]}"
 
 # --- TWR Monthly Returns Utility ---
-
 _price_cache = {}
 
 def get_prev_trading_price(ticker, target_date):
@@ -97,7 +96,7 @@ def compute_monthly_twr(history_df, price_lookup=None):
                     price = price_lookup(t, period_start)
                 else:
                     price = np.nan
-                if np.isnan(price) or price is None:
+                if (price is None) or (isinstance(price, float) and np.isnan(price)):
                     last_trade = df[(df["yahoo_ticker"] == t) & (df["date"] <= period_start)]
                     price = float(last_trade.iloc[-1]["price"]) if not last_trade.empty else 0.0
                 period_start_val += qty * price
@@ -128,7 +127,7 @@ def compute_monthly_twr(history_df, price_lookup=None):
                     price = price_lookup(t, period_end)
                 else:
                     price = np.nan
-                if np.isnan(price) or price is None:
+                if (price is None) or (isinstance(price, float) and np.isnan(price)):
                     last_trade = df[(df["yahoo_ticker"] == t) & (df["date"] <= period_end)]
                     price = float(last_trade.iloc[-1]["price"]) if not last_trade.empty else 0.0
                 period_end_val += qty * price
@@ -173,6 +172,136 @@ def sharpe_ratio(returns, risk_free_rate_annual=0.065):
     excess = ann_ret - risk_free_rate_annual
     sharpe = excess / ann_vol
     return ann_ret, ann_vol, sharpe
+
+# --- NEW HELPERS TO FIX NAME ERRORS ---
+
+def get_monthly_returns_from_prices(close_series: pd.Series) -> pd.Series:
+    """
+    From a price series (DateTimeIndex), compute end-of-month simple returns.
+    """
+    if close_series is None or len(close_series) == 0:
+        return pd.Series(dtype=float)
+    s = close_series.copy()
+    if isinstance(s.index, pd.DatetimeIndex):
+        s.index = s.index.tz_localize(None)
+    s = s.sort_index()
+    monthly = s.resample('M').last()
+    rets = monthly.pct_change().dropna()
+    return rets
+
+def _portfolio_value_on_date(history_df: pd.DataFrame, dt: pd.Timestamp) -> float:
+    """
+    Compute portfolio market value at a specific date using last available price <= dt.
+    """
+    df = history_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df[df["date"] <= dt]
+    holdings = {}
+    for _, r in df.sort_values("date").iterrows():
+        t = r["yahoo_ticker"]
+        q = float(r["quantity"])
+        p = float(r["price"])
+        s = str(r["side"]).strip().lower()
+        if t not in holdings:
+            holdings[t] = 0.0
+        if s.startswith("buy"):
+            holdings[t] += q
+        else:
+            holdings[t] -= q
+    mv = 0.0
+    for t, qty in holdings.items():
+        if qty > 0:
+            px = get_prev_trading_price(t, dt)
+            if px is None:
+                # fallback to last trade price
+                last_trade = df[df["yahoo_ticker"] == t]
+                px = float(last_trade.iloc[-1]["price"]) if not last_trade.empty else 0.0
+            mv += qty * float(px)
+    return float(mv)
+
+def compute_yearly_metrics_from_trades(history_df: pd.DataFrame):
+    """
+    Build minimal per-financial-year metrics used by your table/chart block.
+    Returns (per_year_results, missing_prices_list).
+    """
+    df = history_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    years = sorted(df["date"].apply(get_financial_year).unique())
+    results = []
+    missing = []
+
+    for yr in years:
+        start = pd.Timestamp(datetime.date(yr, 4, 1))
+        end = pd.Timestamp(datetime.date(yr + 1, 3, 31))
+
+        # Beginning and Ending Market Values
+        BMV = _portfolio_value_on_date(df, start)
+        EMV = _portfolio_value_on_date(df, end)
+
+        # Net flows within the FY (buys negative, sells positive)
+        mask = (df["date"] >= start) & (df["date"] <= end)
+        df_yr = df[mask]
+        net_flows = 0.0
+        for _, r in df_yr.iterrows():
+            amt = float(r["quantity"]) * float(r["price"])
+            if str(r["side"]).strip().lower().startswith("buy"):
+                net_flows -= amt
+            else:
+                net_flows += amt
+
+        total_return_amt = EMV - BMV - net_flows
+        return_pct = (total_return_amt / BMV * 100.0) if BMV > 0 else np.nan
+
+        # Approx realized/unrealized placeholders (simple, consistent with available info)
+        realized_amt = df_yr[df_yr["side"].str.lower().str.startswith("sell")]
+        realized_amt = (realized_amt["quantity"].astype(float) * realized_amt["price"].astype(float)).sum()
+        realized_amt = float(realized_amt) if not np.isnan(realized_amt) else 0.0
+
+        avg_portfolio_val = (BMV + EMV) / 2.0
+
+        results.append({
+            "year": int(yr),
+            "BMV": BMV,
+            "EMV": EMV,
+            "net_flows": net_flows,
+            "total_return_amt": total_return_amt,
+            "return_pct": return_pct,
+            "realized_amt": realized_amt,
+            "unrealized_amt": EMV - max(0.0, avg_portfolio_val - net_flows),  # rough placeholder
+            "avg_portfolio_val": avg_portfolio_val
+        })
+    return results, missing
+
+def compute_nifty_yearly_returns(years_list, first_trade):
+    """
+    Map {financial_year -> Nifty return % for that FY} over the trade period.
+    """
+    if first_trade is None or pd.isna(first_trade):
+        return {}
+    first_trade = pd.to_datetime(first_trade)
+    last_date = pd.Timestamp.today()
+    try:
+        nifty_hist = yf.Ticker("^NSEI").history(
+            start=first_trade.strftime("%Y-%m-%d"),
+            end=(last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        )
+        if nifty_hist is None or nifty_hist.empty:
+            return {}
+        nifty_hist.index = nifty_hist.index.tz_localize(None)
+        monthly = get_monthly_returns_from_prices(nifty_hist["Close"])
+        # Compound within each FY
+        df = monthly.to_frame("ret")
+        df["fin_year"] = df.index.to_series().apply(get_financial_year)
+        fy_map = {}
+        for y, grp in df.groupby("fin_year"):
+            if len(grp) == 0:
+                continue
+            cum = (1 + grp["ret"]).prod() - 1
+            fy_map[int(y)] = float(cum * 100.0)
+        # keep only requested years
+        return {int(y): fy_map.get(int(y), np.nan) for y in years_list}
+    except Exception:
+        return {}
 
 # --- TICKER MAPPING / IO ---
 def load_user_mappings():
@@ -555,15 +684,16 @@ with tabs[1]:
                 def f(r): return np.sum(amts / ((1.0 + r) ** times))
                 def fp(r): return np.sum(-amts * times / ((1.0 + r) ** (times + 1.0)))
                 r = 0.1
+                irr_val = None
                 for _ in range(200):
                     val = f(r); der = fp(r)
                     if der == 0: break
                     step = val / der
                     r -= step
-                    if abs(step) < 1e-6: 
+                    if abs(step) < 1e-6:
                         irr_val = r * 100.0
                         break
-            irr_str = color_pct_html(irr_val) if 'irr_val' in locals() and irr_val is not None else irr_str
+            irr_str = color_pct_html(irr_val) if irr_val is not None else irr_str
         except Exception:
             irr_str = "<span style='color:gray;'>N/A</span>"
 
@@ -595,8 +725,11 @@ with tabs[1]:
         start=first_trade_dt.strftime("%Y-%m-%d"),
         end=(last_trade_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     )
-    nifty_hist.index = nifty_hist.index.tz_localize(None)
-    nifty_monthly = nifty_hist["Close"].sort_index().resample('M').last().pct_change().dropna()
+    if nifty_hist is None:
+        nifty_hist = pd.DataFrame()
+    else:
+        nifty_hist.index = nifty_hist.index.tz_localize(None)
+    nifty_monthly = get_monthly_returns_from_prices(nifty_hist["Close"]) if not nifty_hist.empty else pd.Series(dtype=float)
     nifty_ann_ret, nifty_ann_vol, nifty_sharpe = sharpe_ratio(nifty_monthly, risk_free_rate_annual=riskfree)
 
     st.subheader("Portfolio Headline Performance")
@@ -740,31 +873,32 @@ with tabs[1]:
 
         # --- Yearly Sharpe Ratio Calculation & Chart (Monthly Returns) ---
         st.subheader("Portfolio vs Nifty 50: Yearly Sharpe Ratio Comparison")
-        def get_finyear_mask(df, yr):
-            # Dates in financial year: Apr 1 (yr) to Mar 31 (yr+1)
+
+        def get_finyear_mask(index_like, yr):
             start = pd.Timestamp(datetime.date(yr, 4, 1))
             end = pd.Timestamp(datetime.date(yr + 1, 3, 31))
-            return (df.index >= start) & (df.index <= end)
+            return (index_like >= start) & (index_like <= end)
 
         yearly_sharpe_rows = []
-        if not pnl_ts.empty and not nifty_hist.empty:
-            pnl_ts_dtidx = pnl_ts.set_index('date')
+        if (portfolio_monthly_twr is not None) and (not portfolio_monthly_twr.empty) and (not nifty_hist.empty):
+            # Normalize indices to month-end timestamps
+            port_m = pd.Series(portfolio_monthly_twr.values.astype(float),
+                               index=pd.to_datetime(portfolio_monthly_twr.index)).copy()
+            port_m.index = port_m.index.to_period('M').to_timestamp('M')
+
             nifty_mo = get_monthly_returns_from_prices(nifty_hist["Close"])
+
             for yr in years_list:
-                # Portfolio
-                mask = get_finyear_mask(pnl_ts_dtidx, yr)
-                port_monthly = get_monthly_returns_from_pnl(
-                    pnl_ts[pnl_ts['date'].between(
-                        pd.Timestamp(datetime.date(yr,4,1)),
-                        pd.Timestamp(datetime.date(yr+1,3,31))
-                    )]
-                )
-                _, _, port_sharpe_y = sharpe_ratio(port_monthly, risk_free_rate_annual=riskfree)
-                # Nifty
-                mask_nifty = get_finyear_mask(nifty_mo, yr)
-                nifty_sharpe_y = None
-                if not nifty_mo[mask_nifty].empty:
-                    _, _, nifty_sharpe_y = sharpe_ratio(nifty_mo[mask_nifty], risk_free_rate_annual=riskfree)
+                # Portfolio FY mask
+                mask_port = get_finyear_mask(port_m.index, yr)
+                port_slice = port_m[mask_port]
+                _, _, port_sharpe_y = sharpe_ratio(port_slice, risk_free_rate_annual=riskfree)
+
+                # Nifty FY mask
+                mask_nifty = get_finyear_mask(nifty_mo.index, yr)
+                nifty_slice = nifty_mo[mask_nifty]
+                _, _, nifty_sharpe_y = sharpe_ratio(nifty_slice, risk_free_rate_annual=riskfree) if not nifty_slice.empty else (None, None, None)
+
                 yearly_sharpe_rows.append({
                     "year": format_fin_year(yr),
                     "series": "Portfolio",
@@ -775,10 +909,10 @@ with tabs[1]:
                     "series": "Nifty 50",
                     "sharpe": nifty_sharpe_y if nifty_sharpe_y is not None else np.nan
                 })
-        sharpe_chart_df = pd.DataFrame(yearly_sharpe_rows).dropna(subset=["sharpe"])
-        sharpe_chart_df["label"] = sharpe_chart_df["sharpe"].round(2).astype(str)
 
+        sharpe_chart_df = pd.DataFrame(yearly_sharpe_rows).dropna(subset=["sharpe"])
         if not sharpe_chart_df.empty:
+            sharpe_chart_df["label"] = sharpe_chart_df["sharpe"].round(2).astype(str)
             bars = alt.Chart(sharpe_chart_df).mark_bar().encode(
                 x=alt.X("year:O", title="Financial Year", sort=sorted(sharpe_chart_df["year"].unique())),
                 y=alt.Y("sharpe:Q", title="Sharpe Ratio"),
@@ -855,86 +989,83 @@ with tabs[1]:
             start=first_trade_dt.strftime("%Y-%m-%d"),
             end=(last_trade_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
         )
-        nifty_hist.index = nifty_hist.index.tz_localize(None)
-        nifty_closes = nifty_hist["Close"]
+        if nifty_hist is not None and not nifty_hist.empty:
+            nifty_hist.index = nifty_hist.index.tz_localize(None)
+            nifty_closes = nifty_hist["Close"]
 
-        cashflows = build_cashflows_from_history(history_df)
-        cf_by_date = {}
-        for amt, dt in cashflows:
-            d = pd.Timestamp(dt).tz_localize(None)
-            cf_by_date.setdefault(d, 0)
-            cf_by_date[d] += amt
+            cashflows = build_cashflows_from_history(history_df)
+            cf_by_date = {}
+            for amt, dt in cashflows:
+                d = pd.Timestamp(dt).tz_localize(None)
+                cf_by_date.setdefault(d, 0)
+                cf_by_date[d] += amt
 
-        invested = 0.0
-        units = 0.0
-        nifty_pnl_rows = []
-        for dt in trade_dates:
-            dt_naive = pd.Timestamp(dt).tz_localize(None)
-            price_series = nifty_closes[nifty_closes.index <= dt_naive]
-            if price_series.empty:
-                continue
-            price = price_series.iloc[-1]
-            cf = cf_by_date.get(dt_naive, 0)
-            if cf < 0:  # buy
-                units += (-cf) / price
-                invested += -cf
-            elif cf > 0:  # sell
-                units -= (cf / price)
-                invested -= cf
-            curr_value = units * price
-            cumulative_pnl = curr_value - invested
-            nifty_pnl_rows.append({
-                "date": dt_naive,
-                "Nifty_Cum_PNL": cumulative_pnl,
-                "series": "Nifty 50 Simulated"
-            })
+            invested = 0.0
+            units = 0.0
+            nifty_pnl_rows = []
+            for dt in trade_dates:
+                dt_naive = pd.Timestamp(dt).tz_localize(None)
+                price_series = nifty_closes[nifty_closes.index <= dt_naive]
+                if price_series.empty:
+                    continue
+                price = price_series.iloc[-1]
+                cf = cf_by_date.get(dt_naive, 0)
+                if cf < 0:  # buy
+                    units += (-cf) / price
+                    invested += -cf
+                elif cf > 0:  # sell
+                    units -= (cf / price)
+                    invested -= cf
+                curr_value = units * price
+                cumulative_pnl = curr_value - invested
+                nifty_pnl_rows.append({
+                    "date": dt_naive,
+                    "Nifty_Cum_PNL": cumulative_pnl,
+                    "series": "Nifty 50 Simulated"
+                })
 
-        # Combine for legend
-        nifty_pnl_df = pd.DataFrame(nifty_pnl_rows)
-        if not nifty_pnl_df.empty:
-            # Use color for legend, but keep line distinct
-            all_series_df = pd.concat([
-                area_data,
-                nifty_pnl_df.rename(columns={"Nifty_Cum_PNL": "value"})[["date", "series", "value"]]
-            ], ignore_index=True)
+            # Combine for legend
+            nifty_pnl_df = pd.DataFrame(nifty_pnl_rows)
+            if not nifty_pnl_df.empty:
+                chart_area = alt.Chart(area_data).mark_area().encode(
+                    x=alt.X("date:T", title="Date"),
+                    y=alt.Y("value:Q", axis=axis_indian, stack="zero"),
+                    color=alt.Color("series:N", title="Series", scale=alt.Scale(
+                        domain=["Realized", "Unrealized", "Nifty 50 Simulated"],
+                        range=["#d62728", "#1f77b4", "green"]
+                    )),
+                    order=alt.Order('series', sort='ascending'),
+                    opacity=alt.condition(
+                        alt.datum.series == "Nifty 50 Simulated",
+                        alt.value(0),  # Don't show area for Nifty
+                        alt.value(0.7)
+                    ),
+                    tooltip=[
+                        alt.Tooltip("date:T", title="Date"),
+                        alt.Tooltip("series:N", title="Series"),
+                        alt.Tooltip("value:Q", title="Cumulative (₹)", format=",.0f"),
+                    ]
+                )
 
-            chart_area = alt.Chart(area_data).mark_area().encode(
-                x=alt.X("date:T", title="Date"),
-                y=alt.Y("value:Q", axis=axis_indian, stack="zero"),
-                color=alt.Color("series:N", title="Series", scale=alt.Scale(
-                    domain=["Realized", "Unrealized", "Nifty 50 Simulated"],
-                    range=["#d62728", "#1f77b4", "green"]
-                )),
-                order=alt.Order('series', sort='ascending'),
-                opacity=alt.condition(
-                    alt.datum.series == "Nifty 50 Simulated",
-                    alt.value(0),  # Don't show area for Nifty
-                    alt.value(0.7)
-                ),
-                tooltip=[
-                    alt.Tooltip("date:T", title="Date"),
-                    alt.Tooltip("series:N", title="Series"),
-                    alt.Tooltip("value:Q", title="Cumulative (₹)", format=",.0f"),
-                ]
-            )
+                chart_nifty = alt.Chart(nifty_pnl_df).mark_line(
+                    strokeDash=[7,3], color="green", strokeWidth=2
+                ).encode(
+                    x=alt.X("date:T"),
+                    y=alt.Y("Nifty_Cum_PNL:Q", axis=axis_indian),
+                    color=alt.Color("series:N", title="Series", scale=alt.Scale(
+                        domain=["Realized", "Unrealized", "Nifty 50 Simulated"],
+                        range=["#d62728", "#1f77b4", "green"]
+                    )),
+                    tooltip=[
+                        alt.Tooltip("date:T", title="Date"),
+                        alt.Tooltip("Nifty_Cum_PNL:Q", title="Nifty Cumulative P&L (₹)", format=",.0f"),
+                        alt.Tooltip("series:N", title="Series"),
+                    ]
+                )
 
-            chart_nifty = alt.Chart(nifty_pnl_df).mark_line(
-                strokeDash=[7,3], color="green", strokeWidth=2
-            ).encode(
-                x=alt.X("date:T"),
-                y=alt.Y("Nifty_Cum_PNL:Q", axis=axis_indian),
-                color=alt.Color("series:N", title="Series", scale=alt.Scale(
-                    domain=["Realized", "Unrealized", "Nifty 50 Simulated"],
-                    range=["#d62728", "#1f77b4", "green"]
-                )),
-                tooltip=[
-                    alt.Tooltip("date:T", title="Date"),
-                    alt.Tooltip("Nifty_Cum_PNL:Q", title="Nifty Cumulative P&L (₹)", format=",.0f"),
-                    alt.Tooltip("series:N", title="Series"),
-                ]
-            )
-
-            chart_pnl = (chart_area + chart_nifty).properties(height=320)
+                chart_pnl = (chart_area + chart_nifty).properties(height=320)
+            else:
+                chart_pnl = stacked_area.properties(height=320)
         else:
             chart_pnl = stacked_area.properties(height=320)
 
