@@ -27,12 +27,59 @@ def format_fin_year(y):
 # --- Sharpe Ratio Utilities (Monthly Returns) ---
 
 def get_monthly_returns_from_pnl(pnl_ts):
-    # Assumes pnl_ts has 'date' and 'total_pnl'
+    """
+    Calculate monthly returns from portfolio timeline.
+    Uses time-weighted return formula: (End_Value - Begin_Value - Net_Flows) / Begin_Value
+    
+    Args:
+        pnl_ts: DataFrame with columns ['date', 'portfolio_value', 'invested_capital']
+    
+    Returns:
+        pd.Series of monthly returns
+    """
+    if pnl_ts.empty or 'portfolio_value' not in pnl_ts.columns:
+        return pd.Series(dtype=float)
+    
     df = pnl_ts.copy()
     df = df.sort_values('date').set_index('date')
-    df = df.resample('M').last().dropna()
-    df['monthly_return'] = df['total_pnl'].pct_change()
-    return df['monthly_return'].dropna()
+    
+    # Resample to month-end
+    monthly_df = df.resample('M').last().dropna(subset=['portfolio_value'])
+    
+    if len(monthly_df) < 2:
+        return pd.Series(dtype=float)
+    
+    # Calculate monthly returns
+    returns = []
+    for i in range(1, len(monthly_df)):
+        begin_value = monthly_df.iloc[i-1]['portfolio_value']
+        end_value = monthly_df.iloc[i]['portfolio_value']
+        
+        # Net cash flows during the month
+        begin_date = monthly_df.index[i-1]
+        end_date = monthly_df.index[i]
+        
+        # Get all transactions between these dates (exclusive of begin, inclusive of end)
+        mask = (df.index > begin_date) & (df.index <= end_date)
+        period_data = df.loc[mask]
+        
+        if not period_data.empty:
+            # Net flows = change in invested capital during the period
+            begin_capital = monthly_df.iloc[i-1]['invested_capital']
+            end_capital = monthly_df.iloc[i]['invested_capital']
+            net_flows = end_capital - begin_capital
+        else:
+            net_flows = 0.0
+        
+        # Time-weighted return formula
+        if begin_value > 0:
+            monthly_return = (end_value - begin_value - net_flows) / begin_value
+            returns.append(monthly_return)
+        else:
+            # If beginning value is 0 or negative, skip this period
+            returns.append(np.nan)
+    
+    return pd.Series(returns, index=monthly_df.index[1:]).dropna()
 
 def get_monthly_returns_from_prices(prices):
     # prices: Series with DateTimeIndex
@@ -42,8 +89,8 @@ def get_monthly_returns_from_prices(prices):
     return monthly_returns
 
 def annualized_volatility(returns):
-    # Monthly returns to annualized stddev
-    return returns.std(ddof=0) * (12 ** 0.5)
+    # Monthly returns to annualized stddev (using sample std dev with ddof=1)
+    return returns.std(ddof=1) * (12 ** 0.5)
 
 def annualized_return(returns):
     # CAGR from monthly returns
@@ -468,6 +515,7 @@ def pnl_over_time(history_df):
     df = history_df.copy().sort_values("date")
     pos = {}  # ticker -> dict(qty, cost_sum, last_price)
     realized_cum = 0.0
+    invested_capital = 0.0  # Track cumulative net cash flows
     rows = []
 
     for _, r in df.iterrows():
@@ -478,6 +526,13 @@ def pnl_over_time(history_df):
         qty = float(r["quantity"])
         price = float(r["price"])
         dt = pd.to_datetime(r["date"])
+        
+        # Track cash flows
+        cash_flow = qty * price
+        if side == "buy":
+            invested_capital += cash_flow  # Money going in (positive)
+        else:
+            invested_capital -= cash_flow  # Money coming out (negative)
 
         if t not in pos:
             pos[t] = {"qty": 0.0, "cost": 0.0, "last_price": None}
@@ -505,17 +560,28 @@ def pnl_over_time(history_df):
                 avg_c = (p["cost"] / p["qty"]) if p["qty"] > 0 else 0.0
                 unrealized += p["qty"] * (p["last_price"] - avg_c)
 
-        total = realized_cum + unrealized
-        rows.append({"date": dt, "realized_cum": realized_cum, "unrealized_est": unrealized, "total_pnl": total})
+        total_pnl = realized_cum + unrealized
+        portfolio_value = invested_capital + total_pnl  # Portfolio value = capital + P&L
+        
+        rows.append({
+            "date": dt, 
+            "realized_cum": realized_cum, 
+            "unrealized_est": unrealized, 
+            "total_pnl": total_pnl,
+            "invested_capital": invested_capital,
+            "portfolio_value": portfolio_value
+        })
 
     if not rows:
-        return pd.DataFrame(columns=["date", "realized_cum", "unrealized_est", "total_pnl"])
+        return pd.DataFrame(columns=["date", "realized_cum", "unrealized_est", "total_pnl", "invested_capital", "portfolio_value"])
 
     out = pd.DataFrame(rows)
     out = out.groupby("date", as_index=False).agg(
         realized_cum=("realized_cum", "max"),
         unrealized_est=("unrealized_est", "last"),
         total_pnl=("total_pnl", "last"),
+        invested_capital=("invested_capital", "last"),
+        portfolio_value=("portfolio_value", "last"),
     ).sort_values("date").reset_index(drop=True)
     return out
 
@@ -898,22 +964,33 @@ with tabs[1]:
                     alt.Tooltip("sharpe:Q", title="Sharpe Ratio", format=".2f"),
                 ],
             )
-            text = alt.Chart(sharpe_chart_df).mark_text(
-                dy=-10, fontSize=13, color="black"
+            # Positive Sharpe labels in green
+            text_pos = alt.Chart(sharpe_chart_df[sharpe_chart_df["sharpe"] >= 0]).mark_text(
+                dy=-10, fontSize=13, color="green"
             ).encode(
                 x=alt.X("year:O", sort=sorted(sharpe_chart_df["year"].unique())),
                 y=alt.Y("sharpe:Q"),
                 text=alt.Text("label:N"),
                 xOffset=alt.XOffset("series:N"),
             )
-            chart = (bars + text).properties(height=420)
+            
+            # Negative Sharpe labels in red
+            text_neg = alt.Chart(sharpe_chart_df[sharpe_chart_df["sharpe"] < 0]).mark_text(
+                dy=12, fontSize=13, color="red"
+            ).encode(
+                x=alt.X("year:O", sort=sorted(sharpe_chart_df["year"].unique())),
+                y=alt.Y("sharpe:Q"),
+                text=alt.Text("label:N"),
+                xOffset=alt.XOffset("series:N"),
+            )
+            chart = (bars + text_pos + text_neg).properties(height=420)
             st.altair_chart(chart, use_container_width=True)
         else:
             st.info("No yearly sharpe ratios available to plot.")
 
     st.markdown("---")
     
-    # --- Cumulative portfolio profit over time (Total = realized + unrealized estimate) ---
+    # --- Cumulative portfolio profit over time (realized + unrealized) ---
     st.subheader("Cumulative Portfolio Profit Over Time (INR)")
 
     if pnl_ts.empty:
@@ -928,34 +1005,34 @@ with tabs[1]:
             )
         )
 
-        stacked_df = pnl_ts.copy()
-        stacked_df["date"] = pd.to_datetime(stacked_df["date"])
-        stacked_df["Realized"] = stacked_df["realized_cum"]
-        stacked_df["Unrealized"] = stacked_df["unrealized_est"]
-
-        area_data = stacked_df.melt(
-            id_vars=["date"],
-            value_vars=["Realized", "Unrealized"],
-            var_name="series",
-            value_name="value"
-        )
-        area_data["series"] = pd.Categorical(area_data["series"], categories=["Realized", "Unrealized"], ordered=True)
-
-        color_scale = alt.Scale(domain=["Realized", "Unrealized"], range=["#d62728", "#1f77b4"])
-
-        stacked_area = alt.Chart(area_data).mark_area().encode(
+        pnl_line_df = pnl_ts.copy()
+        pnl_line_df["date"] = pd.to_datetime(pnl_line_df["date"])
+        
+        # Main total P&L line
+        total_line = alt.Chart(pnl_line_df).mark_line(
+            color="#2ca02c", strokeWidth=3
+        ).encode(
             x=alt.X("date:T", title="Date"),
-            y=alt.Y("value:Q", axis=axis_indian, stack="zero"),
-            color=alt.Color("series:N", title="Series", scale=color_scale, sort=["Realized", "Unrealized"]),
-            order=alt.Order('series', sort='ascending'),
+            y=alt.Y("total_pnl:Q", axis=axis_indian, title="Cumulative Profit (₹)"),
             tooltip=[
                 alt.Tooltip("date:T", title="Date"),
-                alt.Tooltip("series:N", title="Series"),
-                alt.Tooltip("value:Q", title="Cumulative (₹)", format=",.0f"),
+                alt.Tooltip("total_pnl:Q", title="Total P&L (₹)", format=",.0f"),
+                alt.Tooltip("realized_cum:Q", title="Realized (₹)", format=",.0f"),
+                alt.Tooltip("unrealized_est:Q", title="Unrealized (₹)", format=",.0f"),
             ]
         )
+        
+        # Area fill under the line for visual effect
+        total_area = alt.Chart(pnl_line_df).mark_area(
+            color="#2ca02c", opacity=0.3
+        ).encode(
+            x=alt.X("date:T"),
+            y=alt.Y("total_pnl:Q", axis=axis_indian),
+        )
+        
+        stacked_area = total_area + total_line
 
-        # Nifty 50 comparison line WITH LEGEND
+        # Nifty 50 comparison line
         trade_dates = pnl_ts["date"].sort_values().unique()
         first_trade_dt = pd.to_datetime(history_df["date"].min())
         last_trade_dt = pd.to_datetime(history_df["date"].max())
@@ -994,55 +1071,23 @@ with tabs[1]:
             nifty_pnl_rows.append({
                 "date": dt_naive,
                 "Nifty_Cum_PNL": cumulative_pnl,
-                "series": "Nifty 50 Simulated"
             })
 
-        # Combine for legend
         nifty_pnl_df = pd.DataFrame(nifty_pnl_rows)
         if not nifty_pnl_df.empty:
-            # Use color for legend, but keep line distinct
-            all_series_df = pd.concat([
-                area_data,
-                nifty_pnl_df.rename(columns={"Nifty_Cum_PNL": "value"})[["date", "series", "value"]]
-            ], ignore_index=True)
-
-            chart_area = alt.Chart(area_data).mark_area().encode(
-                x=alt.X("date:T", title="Date"),
-                y=alt.Y("value:Q", axis=axis_indian, stack="zero"),
-                color=alt.Color("series:N", title="Series", scale=alt.Scale(
-                    domain=["Realized", "Unrealized", "Nifty 50 Simulated"],
-                    range=["#d62728", "#1f77b4", "green"]
-                )),
-                order=alt.Order('series', sort='ascending'),
-                opacity=alt.condition(
-                    alt.datum.series == "Nifty 50 Simulated",
-                    alt.value(0),  # Don't show area for Nifty
-                    alt.value(0.7)
-                ),
-                tooltip=[
-                    alt.Tooltip("date:T", title="Date"),
-                    alt.Tooltip("series:N", title="Series"),
-                    alt.Tooltip("value:Q", title="Cumulative (₹)", format=",.0f"),
-                ]
-            )
-
+            # Add Nifty 50 line to the chart
             chart_nifty = alt.Chart(nifty_pnl_df).mark_line(
-                strokeDash=[7,3], color="green", strokeWidth=2
+                strokeDash=[7,3], color="orange", strokeWidth=2
             ).encode(
                 x=alt.X("date:T"),
                 y=alt.Y("Nifty_Cum_PNL:Q", axis=axis_indian),
-                color=alt.Color("series:N", title="Series", scale=alt.Scale(
-                    domain=["Realized", "Unrealized", "Nifty 50 Simulated"],
-                    range=["#d62728", "#1f77b4", "green"]
-                )),
                 tooltip=[
                     alt.Tooltip("date:T", title="Date"),
-                    alt.Tooltip("Nifty_Cum_PNL:Q", title="Nifty Cumulative P&L (₹)", format=",.0f"),
-                    alt.Tooltip("series:N", title="Series"),
+                    alt.Tooltip("Nifty_Cum_PNL:Q", title="Nifty 50 P&L (₹)", format=",.0f"),
                 ]
             )
 
-            chart_pnl = (chart_area + chart_nifty).properties(height=320)
+            chart_pnl = (stacked_area + chart_nifty).properties(height=320)
         else:
             chart_pnl = stacked_area.properties(height=320)
 
@@ -1055,6 +1100,7 @@ with tabs[1]:
             rt["realized_cum_INR"] = rt["realized_cum"].apply(inr_format)
             rt["unrealized_est_INR"] = rt["unrealized_est"].apply(inr_format)
             st.dataframe(rt[["date", "total_pnl_INR", "realized_cum_INR", "unrealized_est_INR"]])
+   
    
     st.markdown("---")
 
