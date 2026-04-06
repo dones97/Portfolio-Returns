@@ -44,7 +44,7 @@ def get_monthly_returns_from_pnl(pnl_ts):
     df = df.sort_values('date').set_index('date')
     
     # Resample to month-end
-    monthly_df = df.resample('M').last().dropna(subset=['portfolio_value'])
+    monthly_df = df.resample('ME').last().dropna(subset=['portfolio_value'])
     
     if len(monthly_df) < 2:
         return pd.Series(dtype=float)
@@ -84,7 +84,7 @@ def get_monthly_returns_from_pnl(pnl_ts):
 def get_monthly_returns_from_prices(prices):
     # prices: Series with DateTimeIndex
     prices = prices.sort_index()
-    monthly_prices = prices.resample('M').last().dropna()
+    monthly_prices = prices.resample('ME').last().dropna()
     monthly_returns = monthly_prices.pct_change().dropna()
     return monthly_returns
 
