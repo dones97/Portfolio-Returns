@@ -668,7 +668,7 @@ with tabs[0]:
 
     repo_reports = get_repository_trade_reports()
     repo_file_names = [fname for fname, _ in repo_reports] if repo_reports else []
-    selected_repo_files = st.multiselect("Select repository trade reports to include", repo_file_names, default=[])
+    selected_repo_files = st.multiselect("Select repository trade reports to include", repo_file_names, default=repo_file_names)
 
     st.subheader("Upstox API Data Fetching")
     upstox_api_key = st.secrets.get("UPSTOX_API_KEY", "") if hasattr(st, "secrets") else ""
