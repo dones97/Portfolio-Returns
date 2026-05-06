@@ -6,6 +6,8 @@ from glob import glob
 import numpy as np
 import datetime
 import altair as alt
+import requests
+import urllib.parse
 
 # --- CONFIG ---
 MAPPINGS_CSV = "ticker_mappings.csv"
@@ -23,6 +25,64 @@ def get_financial_year(dt):
 
 def format_fin_year(y):
     return f"{y}-{str(y+1)[-2:]}"
+
+def fetch_upstox_historical_trades(access_token, start_date, end_date):
+    """Fetch historical trades from Upstox API for given dates"""
+    url = "https://api.upstox.com/v2/charges/historical-trades"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}"
+    }
+    all_records = []
+    page_number = 1
+    page_size = 3000
+    
+    while True:
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "page_number": page_number,
+            "page_size": page_size
+        }
+        try:
+            resp = requests.get(url, headers=headers, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            records = data.get("data", [])
+            if not records:
+                break
+            all_records.extend(records)
+            if len(records) < page_size:
+                break
+            page_number += 1
+        except Exception as e:
+            st.error(f"Error fetching Upstox trades page {page_number}: {e}")
+            break
+            
+    if not all_records:
+        return pd.DataFrame()
+        
+    df = pd.DataFrame(all_records)
+    
+    mapped_df = pd.DataFrame()
+    if 'isin' in df.columns:
+        mapped_df['scrip_code'] = df['isin']
+    elif 'symbol' in df.columns:
+        mapped_df['scrip_code'] = df['symbol']
+    else:
+        mapped_df['scrip_code'] = df.get('scrip_name', 'Unknown')
+        
+    mapped_df['company_name'] = df.get('scrip_name', '')
+    mapped_df['quantity'] = df.get('quantity', 0)
+    mapped_df['price'] = df.get('price', 0.0)
+    mapped_df['side'] = df.get('transaction_type', '')
+    
+    if 'trade_date' in df.columns:
+        mapped_df['date'] = pd.to_datetime(df['trade_date']).dt.date
+    else:
+        mapped_df['date'] = pd.NaT
+        
+    return mapped_df
 
 # --- Sharpe Ratio Utilities (Monthly Returns) ---
 
@@ -601,7 +661,73 @@ with tabs[0]:
     repo_file_names = [fname for fname, _ in repo_reports] if repo_reports else []
     selected_repo_files = st.multiselect("Select repository trade reports to include", repo_file_names, default=[])
 
+    st.subheader("Upstox API Data Fetching")
+    upstox_api_key = st.secrets.get("UPSTOX_API_KEY", "") if hasattr(st, "secrets") else ""
+    upstox_api_secret = st.secrets.get("UPSTOX_API_SECRET", "") if hasattr(st, "secrets") else ""
+    upstox_redirect = st.secrets.get("UPSTOX_REDIRECT_URI", "") if hasattr(st, "secrets") else ""
+
+    if "upstox_api_trades" not in st.session_state:
+        st.session_state["upstox_api_trades"] = None
+
+    if not upstox_api_key or not upstox_api_secret:
+        st.info("Set UPSTOX_API_KEY and UPSTOX_API_SECRET in Streamlit secrets to enable Upstox fetch.")
+    else:
+        auth_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={upstox_api_key}&redirect_uri={urllib.parse.quote(upstox_redirect)}"
+        st.markdown(f"[🔗 Login to Upstox (Get Code)]({auth_url})", unsafe_allow_html=True)
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            auth_code = st.text_input("Enter Upstox Authorization Code", type="password")
+        with col2:
+            st.write("") # spacer
+            st.write("")
+            fetch_clicked = st.button("Fetch Current FY Trades")
+            
+        if fetch_clicked and auth_code:
+            with st.spinner("Authenticating & Fetching..."):
+                try:
+                    token_url = "https://api.upstox.com/v2/login/authorization/token"
+                    headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
+                    payload = {
+                        "code": auth_code,
+                        "client_id": upstox_api_key,
+                        "client_secret": upstox_api_secret,
+                        "redirect_uri": upstox_redirect,
+                        "grant_type": "authorization_code"
+                    }
+                    resp = requests.post(token_url, headers=headers, data=payload)
+                    resp.raise_for_status()
+                    access_token = resp.json().get("access_token")
+                    
+                    if access_token:
+                        today = datetime.date.today()
+                        fy_start_year = get_financial_year(today)
+                        start_date = f"{fy_start_year}-04-01"
+                        end_date = today.strftime("%Y-%m-%d")
+                        
+                        df_trades = fetch_upstox_historical_trades(access_token, start_date, end_date)
+                        if df_trades is not None and not df_trades.empty:
+                            st.session_state["upstox_api_trades"] = df_trades
+                            st.success(f"Successfully fetched {len(df_trades)} trades from Upstox for {start_date} to {end_date}.")
+                        else:
+                            st.warning("No trades found for this period.")
+                    else:
+                        st.error("Failed to get access token from response.")
+                except Exception as e:
+                    st.error(f"Upstox Auth/Fetch Error: {str(e)}")
+                    
+    if st.session_state["upstox_api_trades"] is not None:
+        st.success("Upstox trades ready to be merged.")
+        if st.button("Clear Upstox Data"):
+            st.session_state["upstox_api_trades"] = None
+            st.rerun()
+
+    st.markdown("---")
+
     all_trades = []
+    if st.session_state.get("upstox_api_trades") is not None:
+        all_trades.append(st.session_state["upstox_api_trades"])
+
     if uploaded_files:
         for file in uploaded_files:
             try:
