@@ -84,6 +84,13 @@ def fetch_upstox_historical_trades(access_token, start_date, end_date):
     else:
         mapped_df['date'] = pd.NaT
         
+    mapped_df['Amount'] = df.get('amount', 0.0)
+    mapped_df['Exchange'] = df.get('exchange', '')
+    mapped_df['Segment'] = df.get('segment', '')
+    mapped_df['Instrument Type'] = df.get('option_type', '')
+    mapped_df['Strike Price'] = df.get('strike_price', '')
+
+        
     return mapped_df
 
 # --- Sharpe Ratio Utilities (Monthly Returns) ---
