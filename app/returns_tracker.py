@@ -65,12 +65,14 @@ def fetch_upstox_historical_trades(access_token, start_date, end_date):
     df = pd.DataFrame(all_records)
     
     mapped_df = pd.DataFrame()
-    if 'isin' in df.columns:
-        mapped_df['scrip_code'] = df['isin']
+    if 'scrip_name' in df.columns:
+        mapped_df['scrip_code'] = df['scrip_name']
     elif 'symbol' in df.columns:
         mapped_df['scrip_code'] = df['symbol']
+    elif 'isin' in df.columns:
+        mapped_df['scrip_code'] = df['isin']
     else:
-        mapped_df['scrip_code'] = df.get('scrip_name', 'Unknown')
+        mapped_df['scrip_code'] = 'Unknown'
         
     mapped_df['company_name'] = df.get('scrip_name', '')
     mapped_df['quantity'] = df.get('quantity', 0)
@@ -78,7 +80,7 @@ def fetch_upstox_historical_trades(access_token, start_date, end_date):
     mapped_df['side'] = df.get('transaction_type', '')
     
     if 'trade_date' in df.columns:
-        mapped_df['date'] = pd.to_datetime(df['trade_date']).dt.date
+        mapped_df['date'] = pd.to_datetime(df['trade_date'], errors='coerce').dt.date
     else:
         mapped_df['date'] = pd.NaT
         
@@ -804,7 +806,8 @@ with tabs[1]:
     if "date" not in history_df.columns:
         st.error("portfolio_history.csv missing 'date' column.")
         st.stop()
-    history_df["date"] = pd.to_datetime(history_df["date"])
+    history_df["date"] = pd.to_datetime(history_df["date"], errors="coerce")
+    history_df = history_df.dropna(subset=["date"])
     required_cols = {"yahoo_ticker", "side", "quantity", "price", "date"}
     if not required_cols.issubset(set(history_df.columns)):
         st.error(f"portfolio_history.csv missing columns: {required_cols - set(history_df.columns)}")
