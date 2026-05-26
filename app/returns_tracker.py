@@ -217,7 +217,7 @@ def map_ticker_for_row(row, user_mappings):
     if code in user_mappings:
         return user_mappings[code]
     default_map = default_bse_mapping(code)
-    if default_map and yahoo_ticker_valid(default_map):
+    if default_map:
         return default_map
     return ""
 
@@ -810,6 +810,8 @@ with tabs[1]:
         st.stop()
 
     history_df = pd.read_csv(PORTFOLIO_HISTORY_CSV)
+    if "Date" in history_df.columns:
+        history_df = history_df.rename(columns={"Date": "date"})
     if "date" not in history_df.columns:
         st.error("portfolio_history.csv missing 'date' column.")
         st.stop()
