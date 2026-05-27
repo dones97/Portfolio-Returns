@@ -905,6 +905,22 @@ with tabs[1]:
 
     # --- Sharpe/Stddev headline metrics (Monthly Returns) ---
     pnl_ts = pnl_over_time(history_df)
+
+    # Append a "today" data point using live market prices so the graph's
+    # final value matches the Total Return headline (which uses current prices)
+    today = pd.Timestamp(datetime.date.today())
+    if not pnl_ts.empty:
+        today_row = pd.DataFrame([{
+            "date": today,
+            "realized_cum": total_realized,
+            "unrealized_est": total_unrealized,
+            "total_pnl": total_return_amt,
+            "invested_capital": net_invested,
+            "portfolio_value": curr_value,
+        }])
+        pnl_ts = pd.concat([pnl_ts, today_row], ignore_index=True)
+        pnl_ts = pnl_ts.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+
     riskfree = 0.065
 
     # Portfolio monthly returns
