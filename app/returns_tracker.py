@@ -303,6 +303,7 @@ def get_prev_trading_price(ticker, target_date):
             _price_cache[key] = None
             return None
         hist = hist[hist.index <= target_day]
+        hist = hist.dropna(subset=["Close"])
         if hist.empty:
             _price_cache[key] = None
             return None
@@ -320,6 +321,10 @@ def get_current_price(ticker):
     try:
         hist = yf.Ticker(ticker).history(period="5d")
         if hist is not None and not hist.empty:
+            hist = hist.dropna(subset=["Close"])
+            if hist.empty:
+                _price_cache[key] = None
+                return None
             price = float(hist.iloc[-1]["Close"])
             _price_cache[key] = price
             return price
@@ -821,6 +826,13 @@ with tabs[1]:
     if not required_cols.issubset(set(history_df.columns)):
         st.error(f"portfolio_history.csv missing columns: {required_cols - set(history_df.columns)}")
         st.stop()
+
+    # Re-apply current ticker mappings to refresh any stale yahoo_ticker values
+    current_mappings = load_user_mappings()
+    if current_mappings and "scrip_code" in history_df.columns:
+        history_df["yahoo_ticker"] = history_df.apply(
+            lambda row: map_ticker_for_row(row, current_mappings), axis=1
+        )
 
     # Headline metrics
     realized_df, unrealized_df, total_realized, total_unrealized = calc_realized_unrealized_avgcost(history_df)
