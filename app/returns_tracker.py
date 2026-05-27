@@ -5,6 +5,7 @@ import os
 from glob import glob
 import numpy as np
 import datetime
+import bisect
 import altair as alt
 import requests
 import urllib.parse
@@ -336,6 +337,30 @@ def get_current_price(ticker):
         _price_cache[key] = None
         return None
 
+@st.cache_data(ttl=3600, show_spinner="Fetching historical prices for portfolio timeline...")
+def fetch_all_historical_prices(ticker_tuple, start_date_str, end_date_str):
+    """Batch fetch daily close prices for all tickers using yf.download."""
+    tickers = list(ticker_tuple)
+    if not tickers:
+        return pd.DataFrame()
+    try:
+        data = yf.download(tickers, start=start_date_str, end=end_date_str, progress=False)
+        if data.empty:
+            return pd.DataFrame()
+        # Handle MultiIndex columns (multiple tickers) vs simple columns (single ticker)
+        if isinstance(data.columns, pd.MultiIndex):
+            close_prices = data["Close"].copy()
+        else:
+            close_prices = data[["Close"]].copy()
+            close_prices.columns = tickers
+        # Remove timezone info and forward-fill gaps (weekends/holidays)
+        if close_prices.index.tz is not None:
+            close_prices.index = close_prices.index.tz_localize(None)
+        close_prices = close_prices.ffill()
+        return close_prices
+    except Exception:
+        return pd.DataFrame()
+
 # --- REALIZED / UNREALIZED (average-cost) ---
 def calc_realized_unrealized_avgcost(df):
     result_realized = []
@@ -584,13 +609,25 @@ def compute_nifty_yearly_returns(years, first_trade=None):
             out[year] = None
     return out
     
-# --- P&L timeline (cumulative total = realized + unrealized estimate using last trade prices) ---
-def pnl_over_time(history_df):
+# --- P&L timeline (cumulative total = realized + unrealized using actual market prices) ---
+def pnl_over_time(history_df, close_prices=None):
+    """
+    Build a P&L timeline using actual market prices for unrealized valuation.
+    
+    Args:
+        history_df: DataFrame with trade history
+        close_prices: DataFrame of daily close prices (tickers as columns, dates as index).
+                     If None, unrealized P/L for tickers without prices will be 0.
+    """
     df = history_df.copy().sort_values("date")
-    pos = {}  # ticker -> dict(qty, cost_sum, last_price)
+    df["date"] = pd.to_datetime(df["date"])
+    empty_result = pd.DataFrame(columns=["date", "realized_cum", "unrealized_est", "total_pnl", "invested_capital", "portfolio_value"])
+
+    # --- Step 1: Process trades to build position snapshots at each trade date ---
+    pos = {}  # ticker -> {qty, cost}
     realized_cum = 0.0
-    invested_capital = 0.0  # Track cumulative net cash flows
-    rows = []
+    invested_capital = 0.0
+    daily_states = {}  # normalized_date -> state snapshot
 
     for _, r in df.iterrows():
         t = r.get("yahoo_ticker", "")
@@ -599,22 +636,20 @@ def pnl_over_time(history_df):
         side = str(r["side"]).strip().lower()
         qty = float(r["quantity"])
         price = float(r["price"])
-        dt = pd.to_datetime(r["date"])
-        
-        # Track cash flows
+        dt = pd.to_datetime(r["date"]).normalize()
+
         cash_flow = qty * price
         if side == "buy":
-            invested_capital += cash_flow  # Money going in (positive)
+            invested_capital += cash_flow
         else:
-            invested_capital -= cash_flow  # Money coming out (negative)
+            invested_capital -= cash_flow
 
         if t not in pos:
-            pos[t] = {"qty": 0.0, "cost": 0.0, "last_price": None}
+            pos[t] = {"qty": 0.0, "cost": 0.0}
 
         if side == "buy":
             pos[t]["qty"] += qty
             pos[t]["cost"] += qty * price
-            pos[t]["last_price"] = price
         else:
             avg_cost = (pos[t]["cost"] / pos[t]["qty"]) if pos[t]["qty"] > 0 else 0.0
             realized = qty * (price - avg_cost)
@@ -626,38 +661,75 @@ def pnl_over_time(history_df):
             else:
                 pos[t]["qty"] = remaining_qty
                 pos[t]["cost"] = avg_cost * remaining_qty
-            pos[t]["last_price"] = price
 
-        unrealized = 0.0
-        for k, p in pos.items():
-            if p["qty"] > 0 and p["last_price"] is not None:
-                avg_c = (p["cost"] / p["qty"]) if p["qty"] > 0 else 0.0
-                unrealized += p["qty"] * (p["last_price"] - avg_c)
-
-        total_pnl = realized_cum + unrealized
-        portfolio_value = invested_capital + total_pnl  # Portfolio value = capital + P&L
-        
-        rows.append({
-            "date": dt, 
-            "realized_cum": realized_cum, 
-            "unrealized_est": unrealized, 
-            "total_pnl": total_pnl,
+        daily_states[dt] = {
+            "positions": {k: {"qty": v["qty"], "cost": v["cost"]} for k, v in pos.items()},
+            "realized_cum": realized_cum,
             "invested_capital": invested_capital,
-            "portfolio_value": portfolio_value
+        }
+
+    if not daily_states:
+        return empty_result
+
+    # --- Step 2: Generate weekly sample dates ---
+    sorted_state_dates = sorted(daily_states.keys())
+    first_date = sorted_state_dates[0]
+    today = pd.Timestamp(datetime.date.today())
+
+    sample_dates = pd.date_range(start=first_date, end=today, freq="W-FRI")
+    # Ensure first trade date and today are always included
+    sample_dates = sample_dates.union(pd.DatetimeIndex([first_date, today]))
+
+    # --- Step 3: Pre-compute market prices at each sample date ---
+    prices_at_samples = pd.DataFrame(index=sample_dates)
+    if close_prices is not None and not close_prices.empty:
+        # Merge sample dates into the price index, forward-fill, then select only sample dates
+        all_dates = close_prices.index.union(sample_dates).sort_values()
+        prices_filled = close_prices.reindex(all_dates).ffill()
+        prices_at_samples = prices_filled.reindex(sample_dates)
+
+    # --- Step 4: Compute P/L at each sample date ---
+    rows = []
+    for sample_date in sample_dates:
+        # Binary search for the last state on or before this sample date
+        idx = bisect.bisect_right(sorted_state_dates, sample_date) - 1
+        if idx < 0:
+            continue
+
+        state = daily_states[sorted_state_dates[idx]]
+
+        # Compute unrealized P/L using actual market prices
+        unrealized = 0.0
+        for ticker, position in state["positions"].items():
+            if position["qty"] <= 0:
+                continue
+            avg_cost = (position["cost"] / position["qty"]) if position["qty"] > 0 else 0.0
+
+            market_price = None
+            if ticker in prices_at_samples.columns:
+                val = prices_at_samples.at[sample_date, ticker]
+                if pd.notna(val):
+                    market_price = float(val)
+
+            if market_price is not None:
+                unrealized += position["qty"] * (market_price - avg_cost)
+
+        total_pnl = state["realized_cum"] + unrealized
+        portfolio_value = state["invested_capital"] + total_pnl
+
+        rows.append({
+            "date": sample_date,
+            "realized_cum": state["realized_cum"],
+            "unrealized_est": unrealized,
+            "total_pnl": total_pnl,
+            "invested_capital": state["invested_capital"],
+            "portfolio_value": portfolio_value,
         })
 
     if not rows:
-        return pd.DataFrame(columns=["date", "realized_cum", "unrealized_est", "total_pnl", "invested_capital", "portfolio_value"])
+        return empty_result
 
-    out = pd.DataFrame(rows)
-    out = out.groupby("date", as_index=False).agg(
-        realized_cum=("realized_cum", "max"),
-        unrealized_est=("unrealized_est", "last"),
-        total_pnl=("total_pnl", "last"),
-        invested_capital=("invested_capital", "last"),
-        portfolio_value=("portfolio_value", "last"),
-    ).sort_values("date").reset_index(drop=True)
-    return out
+    return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Portfolio Returns Tracker", layout="wide")
@@ -904,11 +976,19 @@ with tabs[1]:
         nifty_cagr_val = None
 
     # --- Sharpe/Stddev headline metrics (Monthly Returns) ---
-    pnl_ts = pnl_over_time(history_df)
-
-    # Append a "today" data point using live market prices so the graph's
-    # final value matches the Total Return headline (which uses current prices)
+    # Batch-fetch historical prices for all tickers (cached for 1 hour)
+    all_tickers = tuple(sorted([t for t in history_df["yahoo_ticker"].dropna().unique() if t and str(t).strip()]))
+    first_trade_date = history_df["date"].min()
     today = pd.Timestamp(datetime.date.today())
+    close_prices = fetch_all_historical_prices(
+        all_tickers,
+        first_trade_date.strftime("%Y-%m-%d"),
+        (today + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    )
+    pnl_ts = pnl_over_time(history_df, close_prices)
+
+    # Append/replace today's data point using headline metrics (live prices)
+    # to ensure exact alignment between graph endpoint and Total Return display
     if not pnl_ts.empty:
         today_row = pd.DataFrame([{
             "date": today,
