@@ -374,7 +374,7 @@ def fetch_all_historical_prices(ticker_tuple, start_date_str, end_date_str):
     if not tickers:
         return pd.DataFrame()
     try:
-        data = yf.download(tickers, start=start_date_str, end=end_date_str, progress=False)
+        data = yf.download(tickers, start=start_date_str, end=end_date_str, progress=False, auto_adjust=False)
         if data.empty:
             return pd.DataFrame()
         # Handle MultiIndex columns (multiple tickers) vs simple columns (single ticker)
@@ -1323,7 +1323,8 @@ with tabs[1]:
         last_trade_dt = pd.to_datetime(history_df["date"].max())
         nifty_hist = yf.Ticker("^NSEI").history(
             start=first_trade_dt.strftime("%Y-%m-%d"),
-            end=(last_trade_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            end=(last_trade_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+            auto_adjust=False
         )
         nifty_hist.index = nifty_hist.index.tz_localize(None)
         nifty_closes = nifty_hist["Close"]
@@ -1335,8 +1336,10 @@ with tabs[1]:
             cf_by_date.setdefault(d, 0)
             cf_by_date[d] += amt
 
-        invested = 0.0
+        nifty_cost = 0.0
+        nifty_realized = 0.0
         units = 0.0
+        invested = 0.0
         nifty_pnl_rows = []
         for dt in trade_dates:
             dt_naive = pd.Timestamp(dt).tz_localize(None)
@@ -1345,14 +1348,30 @@ with tabs[1]:
                 continue
             price = price_series.iloc[-1]
             cf = cf_by_date.get(dt_naive, 0)
-            if cf < 0:  # buy
-                units += (-cf) / price
-                invested += -cf
-            elif cf > 0:  # sell
-                units -= (cf / price)
-                invested -= cf
+            
+            if cf < 0:  # buy (negative cash flow means we invest)
+                buy_amount = -cf
+                units += buy_amount / price
+                invested += buy_amount
+                nifty_cost += buy_amount
+            elif cf > 0:  # sell (positive cash flow means we withdraw)
+                # Cap the withdrawal so we don't go negative units (shorting Nifty)
+                # This happens if portfolio outperformed Nifty and user withdrew the large profits
+                sell_amount = cf
+                sell_units = sell_amount / price
+                if sell_units > units:
+                    sell_units = units
+                
+                avg_cost = nifty_cost / units if units > 0 else 0.0
+                nifty_realized += sell_units * (price - avg_cost)
+                
+                units -= sell_units
+                invested -= sell_units * price
+                nifty_cost -= sell_units * avg_cost
+
             curr_value = units * price
-            cumulative_pnl = curr_value - invested
+            cumulative_pnl = nifty_realized + (curr_value - nifty_cost)
+            
             nifty_pnl_rows.append({
                 "date": dt_naive,
                 "Nifty_Cum_PNL": cumulative_pnl,
@@ -1396,7 +1415,8 @@ with tabs[1]:
         rf["Profit/Loss Value INR"] = rf["Profit/Loss Value"].apply(inr_format)
         rf["Average Buy Price INR"] = rf["Average Buy Price"].apply(inr_format)
         rf["Average Sell Price INR"] = rf["Average Sell Price"].apply(inr_format)
-        rf["Profit/Loss %"] = rf["Profit/Loss %"].round(2)
+        # Profit/Loss % for realized is None since running average makes it not meaningful
+        rf["Profit/Loss %"] = "N/A"
         rf_display = rf[["Ticker", "Quantity", "Average Buy Price INR", "Average Sell Price INR",
                          "Profit/Loss Value INR", "Profit/Loss %"]]
         st.dataframe(rf_display)
