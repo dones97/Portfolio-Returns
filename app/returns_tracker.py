@@ -10,6 +10,36 @@ import altair as alt
 import requests
 import urllib.parse
 
+# --- TRADE SORTING UTILITY ---
+def sort_trades_properly(df):
+    """Sort trades by date + Trade Time, handling varied time formats.
+    Falls back to buys-before-sells within same date if Trade Time is missing."""
+    df = df.copy()
+    if "Trade Time" in df.columns:
+        def _normalize_time(t):
+            if pd.isna(t) or str(t).strip() == '':
+                return '12:00:00'
+            t = str(t).strip()
+            parts = t.split(':')
+            if len(parts) == 2:
+                return t + ':00'
+            return t
+        df["_trade_time_norm"] = df["Trade Time"].apply(_normalize_time)
+        df["_sort_time"] = pd.to_datetime(
+            df["date"].dt.strftime("%Y-%m-%d") + " " + df["_trade_time_norm"],
+            errors="coerce"
+        )
+        # Fallback for any remaining NaT: use date + 12:00:00
+        nat_mask = df["_sort_time"].isna()
+        if nat_mask.any():
+            df.loc[nat_mask, "_sort_time"] = df.loc[nat_mask, "date"] + pd.Timedelta(hours=12)
+        df = df.sort_values(["_sort_time"]).drop(columns=["_sort_time", "_trade_time_norm"])
+    else:
+        # Fallback: sort buys before sells within same date to avoid negative positions
+        df["_side_order"] = df["side"].str.lower().map({"buy": 0, "sell": 1}).fillna(0)
+        df = df.sort_values(["date", "_side_order"]).drop(columns=["_side_order"])
+    return df
+
 # --- CONFIG ---
 MAPPINGS_CSV = "ticker_mappings.csv"
 TRADE_REPORTS_DIR = "trade_reports"
@@ -361,51 +391,63 @@ def fetch_all_historical_prices(ticker_tuple, start_date_str, end_date_str):
     except Exception:
         return pd.DataFrame()
 
-# --- REALIZED / UNREALIZED (average-cost) ---
+# --- REALIZED / UNREALIZED (running average-cost, chronological) ---
 def calc_realized_unrealized_avgcost(df):
+    """Compute per-ticker realized/unrealized P/L using running average cost.
+    Trades are sorted by date + Trade Time to ensure correct chronological order."""
     result_realized = []
     result_unrealized = []
 
     for ticker, trades in df.groupby("yahoo_ticker"):
-        trades = trades.sort_values("date")
-        buys = trades[trades["side"].str.lower() == "buy"].copy()
-        sells = trades[trades["side"].str.lower() == "sell"].copy()
+        trades = sort_trades_properly(trades)
 
-        total_buy_qty = buys["quantity"].astype(float).sum()
-        total_buy_amt = (buys["quantity"].astype(float) * buys["price"].astype(float)).sum()
-        avg_buy_price = total_buy_amt / total_buy_qty if total_buy_qty else 0
+        # Walk through trades chronologically with running average cost
+        pos_qty = 0.0
+        pos_cost = 0.0
+        realized_pl_value = 0.0
+        total_sold_qty = 0.0
 
-        total_sell_qty = sells["quantity"].astype(float).sum()
-        total_sell_amt = (sells["quantity"].astype(float) * sells["price"].astype(float)).sum()
-        avg_sell_price = total_sell_amt / total_sell_qty if total_sell_qty else 0
+        for _, r in trades.iterrows():
+            side = str(r["side"]).strip().lower()
+            qty = float(r["quantity"])
+            price = float(r["price"])
 
-        realized_qty = min(total_sell_qty, total_buy_qty)
-        realized_buy_amt = realized_qty * avg_buy_price
-        realized_sell_amt = realized_qty * avg_sell_price
-        realized_pl_value = realized_sell_amt - realized_buy_amt
-        realized_pl_pct = ((avg_sell_price - avg_buy_price) / avg_buy_price * 100) if avg_buy_price else 0
+            if side == "buy":
+                pos_qty += qty
+                pos_cost += qty * price
+            else:
+                avg_cost = (pos_cost / pos_qty) if pos_qty > 0 else 0.0
+                realized_pl_value += qty * (price - avg_cost)
+                total_sold_qty += qty
+                remaining = pos_qty - qty
+                if remaining <= 0:
+                    pos_qty = 0.0
+                    pos_cost = 0.0
+                else:
+                    pos_qty = remaining
+                    pos_cost = avg_cost * remaining
 
-        if realized_qty > 0:
+        avg_cost_now = (pos_cost / pos_qty) if pos_qty > 0 else 0.0
+
+        if total_sold_qty > 0:
             result_realized.append({
                 "Ticker": ticker,
-                "Quantity": int(realized_qty),
-                "Average Buy Price": round(avg_buy_price, 2),
-                "Average Sell Price": round(avg_sell_price, 2),
+                "Quantity": int(total_sold_qty),
+                "Average Buy Price": round(avg_cost_now, 2) if pos_qty > 0 else "N/A",
+                "Average Sell Price": "N/A",
                 "Profit/Loss Value": realized_pl_value,
-                "Profit/Loss %": realized_pl_pct
+                "Profit/Loss %": None  # not meaningful for running avg
             })
 
-        unrealized_qty = total_buy_qty - total_sell_qty
-        if unrealized_qty > 0:
+        if pos_qty > 0:
             current_price = get_current_price(ticker)
-            unrealized_buy_amt = unrealized_qty * avg_buy_price
-            unrealized_curr_amt = unrealized_qty * current_price if current_price is not None else None
-            unrealized_pl_value = (unrealized_curr_amt - unrealized_buy_amt) if current_price is not None else None
-            unrealized_pl_pct = ((current_price - avg_buy_price) / avg_buy_price * 100) if (current_price is not None and avg_buy_price) else None
+            unrealized_curr_amt = pos_qty * current_price if current_price is not None else None
+            unrealized_pl_value = (unrealized_curr_amt - pos_cost) if current_price is not None else None
+            unrealized_pl_pct = ((current_price - avg_cost_now) / avg_cost_now * 100) if (current_price is not None and avg_cost_now > 0) else None
             result_unrealized.append({
                 "Ticker": ticker,
-                "Quantity": int(unrealized_qty),
-                "Average Buy Price": round(avg_buy_price, 2),
+                "Quantity": int(pos_qty),
+                "Average Buy Price": round(avg_cost_now, 2),
                 "Current Price": round(current_price, 2) if current_price is not None else "N/A",
                 "Profit/Loss Value": unrealized_pl_value if unrealized_pl_value is not None else "N/A",
                 "Profit/Loss %": unrealized_pl_pct if unrealized_pl_pct is not None else "N/A"
@@ -421,7 +463,7 @@ def calc_realized_unrealized_avgcost(df):
 # --- XIRR cashflows ---
 def build_cashflows_from_history(history_df):
     cfs = []
-    for _, r in history_df.sort_values("date").iterrows():
+    for _, r in sort_trades_properly(history_df).iterrows():
         qty = float(r["quantity"])
         price = float(r["price"])
         dt = pd.to_datetime(r["date"])
@@ -434,7 +476,7 @@ def build_cashflows_from_history(history_df):
 
 # --- Realized by year (avg-cost sim) ---
 def compute_realized_pl_by_year(history_df):
-    df = history_df.copy().sort_values("date")
+    df = sort_trades_properly(history_df.copy())
     realized_by_year = {}
     pos = {}
     for _, r in df.iterrows():
@@ -619,7 +661,7 @@ def pnl_over_time(history_df, close_prices=None):
         close_prices: DataFrame of daily close prices (tickers as columns, dates as index).
                      If None, unrealized P/L for tickers without prices will be 0.
     """
-    df = history_df.copy().sort_values("date")
+    df = sort_trades_properly(history_df.copy())
     df["date"] = pd.to_datetime(df["date"])
     empty_result = pd.DataFrame(columns=["date", "realized_cum", "unrealized_est", "total_pnl", "invested_capital", "portfolio_value"])
 
@@ -987,19 +1029,16 @@ with tabs[1]:
     )
     pnl_ts = pnl_over_time(history_df, close_prices)
 
-    # Append/replace today's data point using headline metrics (live prices)
-    # to ensure exact alignment between graph endpoint and Total Return display
+    # Derive headline totals from the pnl timeline's latest data point.
+    # This ensures exact alignment between the chart and the headline metrics.
     if not pnl_ts.empty:
-        today_row = pd.DataFrame([{
-            "date": today,
-            "realized_cum": total_realized,
-            "unrealized_est": total_unrealized,
-            "total_pnl": total_return_amt,
-            "invested_capital": net_invested,
-            "portfolio_value": curr_value,
-        }])
-        pnl_ts = pd.concat([pnl_ts, today_row], ignore_index=True)
-        pnl_ts = pnl_ts.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+        latest = pnl_ts.iloc[-1]
+        total_realized = latest["realized_cum"]
+        total_unrealized = latest["unrealized_est"]
+        total_return_amt = latest["total_pnl"]
+        total_return_pct = (total_return_amt / net_invested * 100.0) if net_invested > 0 else None
+        realized_pct = (total_realized / net_invested * 100.0) if net_invested > 0 else None
+        unrealized_pct = (total_unrealized / net_invested * 100.0) if net_invested > 0 else None
 
     riskfree = 0.065
 
