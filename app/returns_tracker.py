@@ -171,14 +171,16 @@ def get_monthly_returns_from_pnl(pnl_ts):
         else:
             net_flows = 0.0
         
-        # Time-weighted return formula
-        if begin_value > 0:
-            monthly_return = (end_value - begin_value - net_flows) / begin_value
+        # Time-weighted return approximation (Modified Dietz method)
+        # Assumes cash flows occur mid-month on average
+        denominator = begin_value + (net_flows / 2.0)
+        if denominator > 0:
+            monthly_return = (end_value - begin_value - net_flows) / denominator
             returns.append(monthly_return)
         else:
             # If beginning value is 0 or negative, skip this period
             returns.append(np.nan)
-    
+
     return pd.Series(returns, index=monthly_df.index[1:]).dropna()
 
 def get_monthly_returns_from_prices(prices):
@@ -532,14 +534,16 @@ def compute_yearly_metrics_from_trades(history_df):
 
     history_df = history_df.copy().sort_values("date")
     history_df["date"] = pd.to_datetime(history_df["date"])
-    first_year = history_df["date"].dt.year.min()
-    last_year = history_df["date"].dt.year.max()
-    years = list(range(first_year, last_year + 1))
+    
+    first_date = history_df["date"].min()
+    first_fy = first_date.year if first_date.month >= 4 else first_date.year - 1
+    current_fy = today.year if today.month >= 4 else today.year - 1
+    
+    years = list(range(first_fy, current_fy + 1))
 
     realized_by_year = compute_realized_pl_by_year(history_df)
     missing_prices = []
     results = []
-    today = pd.Timestamp(datetime.date.today())
 
     def holdings_as_of(dt, inclusive=False):
         if inclusive:
@@ -555,8 +559,8 @@ def compute_yearly_metrics_from_trades(history_df):
         return net
 
     for y in years:
-        start_dt = pd.Timestamp(datetime.date(y, 1, 1))
-        end_dt = pd.Timestamp(datetime.date(y, 12, 31))
+        start_dt = pd.Timestamp(datetime.date(y, 4, 1))
+        end_dt = pd.Timestamp(datetime.date(y + 1, 3, 31))
         end_eff = min(end_dt, today)
 
         b_hold = holdings_as_of(start_dt, inclusive=False)
