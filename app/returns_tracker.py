@@ -406,6 +406,8 @@ def calc_realized_unrealized_avgcost(df):
         pos_cost = 0.0
         realized_pl_value = 0.0
         total_sold_qty = 0.0
+        total_sell_proceeds = 0.0
+        total_cost_of_sold = 0.0
 
         for _, r in trades.iterrows():
             side = str(r["side"]).strip().lower()
@@ -419,6 +421,8 @@ def calc_realized_unrealized_avgcost(df):
                 avg_cost = (pos_cost / pos_qty) if pos_qty > 0 else 0.0
                 realized_pl_value += qty * (price - avg_cost)
                 total_sold_qty += qty
+                total_sell_proceeds += qty * price
+                total_cost_of_sold += qty * avg_cost
                 remaining = pos_qty - qty
                 if remaining <= 0:
                     pos_qty = 0.0
@@ -430,13 +434,16 @@ def calc_realized_unrealized_avgcost(df):
         avg_cost_now = (pos_cost / pos_qty) if pos_qty > 0 else 0.0
 
         if total_sold_qty > 0:
+            avg_sell_price = total_sell_proceeds / total_sold_qty
+            avg_buy_price = total_cost_of_sold / total_sold_qty
+            pl_pct = ((avg_sell_price - avg_buy_price) / avg_buy_price * 100) if avg_buy_price > 0 else 0.0
             result_realized.append({
                 "Ticker": ticker,
                 "Quantity": int(total_sold_qty),
-                "Average Buy Price": round(avg_cost_now, 2) if pos_qty > 0 else "N/A",
-                "Average Sell Price": "N/A",
+                "Average Buy Price": round(avg_buy_price, 2),
+                "Average Sell Price": round(avg_sell_price, 2),
                 "Profit/Loss Value": realized_pl_value,
-                "Profit/Loss %": None  # not meaningful for running avg
+                "Profit/Loss %": round(pl_pct, 2)
             })
 
         if pos_qty > 0:
@@ -1411,35 +1418,37 @@ with tabs[1]:
     # --- Realized / Unrealized tables (no styled variants) ---
     st.subheader("Realized Returns (Average Costing)")
     if not realized_df.empty:
-        rf = realized_df.copy()
-        rf["Profit/Loss Value INR"] = rf["Profit/Loss Value"].apply(inr_format)
-        rf["Average Buy Price INR"] = rf["Average Buy Price"].apply(inr_format)
-        rf["Average Sell Price INR"] = rf["Average Sell Price"].apply(inr_format)
-        # Profit/Loss % for realized is None since running average makes it not meaningful
-        rf["Profit/Loss %"] = "N/A"
-        rf_display = rf[["Ticker", "Quantity", "Average Buy Price INR", "Average Sell Price INR",
-                         "Profit/Loss Value INR", "Profit/Loss %"]]
-        st.dataframe(rf_display)
+        # Do not convert to string format so that columns remain sortable numbers
+        rf_display = realized_df.copy()
+        
+        col_config = {
+            "Average Buy Price": st.column_config.NumberColumn("Average Buy Price", format="₹ %.2f"),
+            "Average Sell Price": st.column_config.NumberColumn("Average Sell Price", format="₹ %.2f"),
+            "Profit/Loss Value": st.column_config.NumberColumn("Profit/Loss Value", format="₹ %.2f"),
+            "Profit/Loss %": st.column_config.NumberColumn("Profit/Loss %", format="%.2f%%")
+        }
+        
+        st.dataframe(rf_display, column_config=col_config)
         st.markdown(f"**Total Realized Profit/Loss:** {inr_format(total_realized)}")
     else:
         st.info("No realized trades or profit/loss yet.")
 
     st.subheader("Unrealized Returns (Average Costing)")
     if not unrealized_df.empty:
-        uf = unrealized_df.copy()
-        uf["Profit/Loss Value INR"] = uf["Profit/Loss Value"].apply(lambda x: inr_format(x) if x != "N/A" else "N/A")
-        uf["Average Buy Price INR"] = uf["Average Buy Price"].apply(inr_format)
-        uf["Current Price INR"] = uf["Current Price"].apply(lambda x: inr_format(x) if x != "N/A" else "N/A")
-        # numeric for sorting
-        def to_num(x):
-            try:
-                return float(x)
-            except:
-                return np.nan
-        uf["Profit/Loss %"] = uf["Profit/Loss %"].apply(lambda x: round(float(x), 2) if x != "N/A" else np.nan)
-        uf_display = uf[["Ticker", "Quantity", "Average Buy Price INR", "Current Price INR",
-                         "Profit/Loss Value INR", "Profit/Loss %"]]
-        st.dataframe(uf_display)
+        uf_display = unrealized_df.copy()
+        
+        col_config = {
+            "Average Buy Price": st.column_config.NumberColumn("Average Buy Price", format="₹ %.2f"),
+            "Current Price": st.column_config.NumberColumn("Current Price", format="₹ %.2f"),
+            "Profit/Loss Value": st.column_config.NumberColumn("Profit/Loss Value", format="₹ %.2f"),
+            "Profit/Loss %": st.column_config.NumberColumn("Profit/Loss %", format="%.2f%%")
+        }
+
+        # Some "N/A" might exist in Current Price etc., convert to NaN for proper NumberColumn handling
+        for col in ["Current Price", "Profit/Loss Value", "Profit/Loss %"]:
+            uf_display[col] = pd.to_numeric(uf_display[col], errors='coerce')
+
+        st.dataframe(uf_display, column_config=col_config)
         st.markdown(f"**Total Unrealized Profit/Loss:** {inr_format(total_unrealized)}")
     else:
         st.info("No unrealized holdings.")
