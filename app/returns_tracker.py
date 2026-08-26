@@ -662,6 +662,137 @@ def compute_nifty_yearly_returns(years, first_trade=None):
             out[year] = None
     return out
     
+# --- Monthly Returns Table (Portfolio vs Nifty 50) ---
+def compute_monthly_returns_table(pnl_ts, first_trade_date, today_ts):
+    """
+    Compute monthly true profit/loss returns for portfolio and Nifty 50.
+
+    Uses Modified Dietz method for portfolio returns (consistent with Sharpe ratio).
+    Strips out cash flows to show only true investment gains/losses.
+    Handles partial months at inception and current month.
+
+    Args:
+        pnl_ts: DataFrame from pnl_over_time() with portfolio_value, invested_capital
+        first_trade_date: Date of first trade (inception)
+        today_ts: Current date
+
+    Returns:
+        DataFrame with columns: Month, Portfolio Return (%), Nifty 50 Return (%)
+    """
+    if pnl_ts.empty:
+        return pd.DataFrame()
+
+    df = pnl_ts.copy().sort_values('date')
+    df['date'] = pd.to_datetime(df['date'])
+
+    first_date = pd.Timestamp(first_trade_date).normalize()
+    today_date = pd.Timestamp(today_ts).normalize()
+
+    # Build month boundary dates
+    inception_month_end = first_date + pd.offsets.MonthEnd(0)
+
+    all_month_ends = pd.date_range(
+        start=inception_month_end,
+        end=today_date,
+        freq='ME'
+    )
+
+    # Ordered boundaries: [first_date, month_end_1, ..., today]
+    boundaries = [first_date]
+    for me in all_month_ends:
+        if me > first_date and me < today_date:
+            boundaries.append(me)
+    if boundaries[-1] < today_date:
+        boundaries.append(today_date)
+
+    if len(boundaries) < 2:
+        return pd.DataFrame()
+
+    # Helper: get portfolio_value and invested_capital at or before a date
+    def get_values_at(target_date):
+        mask = df['date'] <= target_date
+        if mask.any():
+            row = df.loc[mask].iloc[-1]
+            return row['portfolio_value'], row['invested_capital']
+        return None, None
+
+    # Fetch Nifty 50 prices for the full period
+    try:
+        nifty_hist_monthly = yf.Ticker("^NSEI").history(
+            start=(first_date - pd.Timedelta(days=10)).strftime("%Y-%m-%d"),
+            end=(today_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        )
+        if nifty_hist_monthly is not None and not nifty_hist_monthly.empty:
+            if nifty_hist_monthly.index.tz is not None:
+                nifty_hist_monthly.index = nifty_hist_monthly.index.tz_localize(None)
+            nifty_closes_monthly = nifty_hist_monthly["Close"]
+        else:
+            nifty_closes_monthly = pd.Series(dtype=float)
+    except Exception:
+        nifty_closes_monthly = pd.Series(dtype=float)
+
+    def get_nifty_price_at(target_date):
+        if nifty_closes_monthly.empty:
+            return None
+        mask = nifty_closes_monthly.index <= target_date
+        if mask.any():
+            return float(nifty_closes_monthly[mask].iloc[-1])
+        return None
+
+    results = []
+    for i in range(1, len(boundaries)):
+        begin_date = boundaries[i - 1]
+        end_date = boundaries[i]
+
+        begin_pv, begin_ic = get_values_at(begin_date)
+        end_pv, end_ic = get_values_at(end_date)
+
+        if begin_pv is None or end_pv is None:
+            continue
+
+        # Modified Dietz return (same methodology as Sharpe calculation)
+        net_flows = end_ic - begin_ic
+        denominator = begin_pv + (net_flows / 2.0)
+
+        if denominator > 0:
+            portfolio_return = (end_pv - begin_pv - net_flows) / denominator * 100.0
+        else:
+            portfolio_return = None
+
+        # Nifty 50 simple price return
+        nifty_start = get_nifty_price_at(begin_date)
+        nifty_end = get_nifty_price_at(end_date)
+
+        if nifty_start is not None and nifty_end is not None and nifty_start > 0:
+            nifty_return = (nifty_end / nifty_start - 1.0) * 100.0
+        else:
+            nifty_return = None
+
+        # Format month label using end_date
+        month_label = end_date.strftime('%b %Y')
+
+        is_first = (i == 1)
+        is_last = (i == len(boundaries) - 1)
+
+        # Partial inception month: first trade not on 1st, end in same month
+        if is_first and end_date.month == first_date.month and end_date.year == first_date.year and first_date.day != 1:
+            month_label += ' (partial)'
+
+        # Partial current month: today is not month-end
+        if is_last:
+            month_end_check = today_date + pd.offsets.MonthEnd(0)
+            if today_date < month_end_check:
+                if '(partial)' not in month_label:
+                    month_label += ' (partial)'
+
+        results.append({
+            'Month': month_label,
+            'Portfolio Return (%)': round(portfolio_return, 2) if portfolio_return is not None else None,
+            'Nifty 50 Return (%)': round(nifty_return, 2) if nifty_return is not None else None,
+        })
+
+    return pd.DataFrame(results)
+
 # --- P&L timeline (cumulative total = realized + unrealized using actual market prices) ---
 def pnl_over_time(history_df, close_prices=None):
     """
@@ -1109,6 +1240,37 @@ with tabs[1]:
         st.markdown(f"**{inr_format(total_unrealized)}**")
         if unrealized_pct is not None:
             st.markdown(f"({color_pct_html(unrealized_pct)})", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # --- Monthly Returns Table: Portfolio vs Nifty 50 ---
+    st.subheader("Monthly Returns: Portfolio vs Nifty 50")
+
+    monthly_table = compute_monthly_returns_table(pnl_ts, first_trade_date, today)
+    if not monthly_table.empty:
+        col_config_monthly = {
+            "Portfolio Return (%)": st.column_config.NumberColumn(
+                "Portfolio Return (%)", format="%.2f%%"
+            ),
+            "Nifty 50 Return (%)": st.column_config.NumberColumn(
+                "Nifty 50 Return (%)", format="%.2f%%"
+            ),
+        }
+        st.dataframe(monthly_table, column_config=col_config_monthly, hide_index=True, use_container_width=True)
+
+        # Show cumulative compounded returns
+        port_returns = monthly_table["Portfolio Return (%)"].dropna() / 100.0
+        nifty_returns = monthly_table["Nifty 50 Return (%)"].dropna() / 100.0
+        cum_port = ((1 + port_returns).prod() - 1) * 100.0 if not port_returns.empty else None
+        cum_nifty = ((1 + nifty_returns).prod() - 1) * 100.0 if not nifty_returns.empty else None
+
+        cum_col1, cum_col2 = st.columns(2)
+        with cum_col1:
+            st.markdown(f"**Cumulative Portfolio Return:** {color_pct_html(cum_port) if cum_port is not None else 'N/A'}", unsafe_allow_html=True)
+        with cum_col2:
+            st.markdown(f"**Cumulative Nifty 50 Return:** {color_pct_html(cum_nifty) if cum_nifty is not None else 'N/A'}", unsafe_allow_html=True)
+    else:
+        st.info("Not enough data to compute monthly returns.")
 
     st.markdown("---")
 
