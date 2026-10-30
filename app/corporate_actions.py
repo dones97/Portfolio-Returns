@@ -7,14 +7,39 @@ Dividends cover the whole trade history, whichever broker held the shares.
 """
 import math
 
+import numpy as np
 import pandas as pd
+
+
+def normalize_action_dates(series):
+    """Return a Yahoo action series indexed by plain dates.
+
+    Some yfinance versions stamp actions at the market open. Trade dates are at
+    midnight, so a timestamped ex-date would count that day's trades as prior.
+    """
+    if not isinstance(series.index, pd.DatetimeIndex):
+        return series
+    series = series.copy()
+    if series.index.tz is not None:
+        series.index = series.index.tz_localize(None)
+    series.index = series.index.normalize()
+    return series
+
+
+def _signed_quantity(trades):
+    """Return quantities as positive for buys and negative for sells.
+
+    Built with numpy because pandas 3 keeps a text dtype when mapping an empty
+    text column, which then fails on multiplication.
+    """
+    sides = trades["side"].astype(object).str.lower()
+    signs = np.where(sides == "buy", 1.0, np.where(sides == "sell", -1.0, 0.0))
+    return pd.to_numeric(trades["quantity"]) * signs
 
 
 def _quantity_held(trades, before_date):
     """Return the net quantity from trades dated before the given date."""
-    prior = trades[trades["date"] < before_date]
-    signs = prior["side"].str.lower().map({"buy": 1, "sell": -1})
-    return float((prior["quantity"] * signs).sum())
+    return float(_signed_quantity(trades[trades["date"] < before_date]).sum())
 
 
 def bonus_rows(dhan_trades, splits_by_ticker):
@@ -88,8 +113,7 @@ def holdings_mismatches(dhan_trades, holdings, as_of):
     trading sessions. Bonus shares can show here until they are credited.
     """
     prior = dhan_trades[dhan_trades["date"] < as_of]
-    signs = prior["side"].str.lower().map({"buy": 1, "sell": -1})
-    from_trades = (prior["quantity"] * signs).groupby(prior["isin"]).sum()
+    from_trades = _signed_quantity(prior).groupby(prior["isin"]).sum()
     at_dhan = {h.get("isin"): float(h.get("totalQty", 0)) for h in holdings}
     symbols = {h.get("isin"): h.get("tradingSymbol") for h in holdings}
     names = dict(zip(dhan_trades["isin"], dhan_trades["yahoo_ticker"]))

@@ -9,7 +9,12 @@ import datetime
 import bisect
 from concurrent.futures import ThreadPoolExecutor
 import altair as alt
-from corporate_actions import bonus_rows, dividend_rows, holdings_mismatches
+from corporate_actions import (
+    bonus_rows,
+    dividend_rows,
+    holdings_mismatches,
+    normalize_action_dates,
+)
 from dhan_client import (
     exchange_dhan_token_id,
     fetch_dhan_holdings,
@@ -337,7 +342,7 @@ def fetch_all_historical_prices(ticker_tuple, start_date_str, end_date_str):
 
 @st.cache_data(ttl=3600, show_spinner="Fetching corporate actions from Yahoo...")
 def fetch_corporate_actions(ticker_tuple):
-    """Fetch per-ticker splits and dividends, with timezones removed.
+    """Fetch per-ticker splits and dividends, indexed by plain dates.
 
     Also returns the tickers Yahoo has no data for, whose actions are unknown.
     """
@@ -359,10 +364,7 @@ def fetch_corporate_actions(ticker_tuple):
             unavailable.append(ticker)
             continue
         for series, target in zip(result, (splits_by_ticker, dividends_by_ticker)):
-            if getattr(series.index, "tz", None) is not None:
-                series = series.copy()
-                series.index = series.index.tz_localize(None)
-            target[ticker] = series
+            target[ticker] = normalize_action_dates(series)
     return splits_by_ticker, dividends_by_ticker, unavailable
 
 # --- REALIZED / UNREALIZED (running average-cost, chronological) ---

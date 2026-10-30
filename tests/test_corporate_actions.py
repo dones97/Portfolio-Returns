@@ -28,6 +28,17 @@ def series(**values):
     return pd.Series(list(values.values()), index=index, dtype=float)
 
 
+def test_action_dates_lose_timezone_and_market_open_time():
+    index = pd.DatetimeIndex(["2026-03-13 09:15:00"], tz="Asia/Kolkata")
+    result = ca.normalize_action_dates(pd.Series([2.0], index=index))
+    assert result.index[0] == pd.Timestamp("2026-03-13")
+    assert result.index.tz is None
+
+
+def test_empty_series_without_dates_is_left_alone():
+    assert ca.normalize_action_dates(pd.Series(dtype=float)).empty
+
+
 def test_bonus_applies_only_to_shares_held_before_ex_date():
     df = trades(("2026-10-16", "Buy", 10), ("2026-11-05", "Buy", 7))
     rows = ca.bonus_rows(df, {"ABC.NS": series(d_2026_11_05=2.0)})
