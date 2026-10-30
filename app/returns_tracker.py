@@ -8,7 +8,13 @@ import numpy as np
 import datetime
 import bisect
 import altair as alt
-from dhan_client import fetch_dhan_trades
+from corporate_actions import bonus_rows, dividend_rows, holdings_mismatches
+from dhan_client import (
+    exchange_dhan_token_id,
+    fetch_dhan_holdings,
+    fetch_dhan_trades,
+    generate_dhan_login_url,
+)
 
 # --- TRADE SORTING UTILITY ---
 def sort_trades_properly(df):
@@ -327,6 +333,24 @@ def fetch_all_historical_prices(ticker_tuple, start_date_str, end_date_str):
         return close_prices
     except Exception:
         return pd.DataFrame()
+
+@st.cache_data(ttl=3600, show_spinner="Fetching corporate actions from Yahoo...")
+def fetch_corporate_actions(ticker_tuple):
+    """Fetch per-ticker splits and dividends, with timezones removed."""
+    splits_by_ticker, dividends_by_ticker = {}, {}
+    for ticker in ticker_tuple:
+        try:
+            yf_ticker = yf.Ticker(ticker)
+            splits = yf_ticker.splits
+            dividends = yf_ticker.dividends
+        except Exception:
+            continue
+        for series, target in ((splits, splits_by_ticker), (dividends, dividends_by_ticker)):
+            if getattr(series.index, "tz", None) is not None:
+                series = series.copy()
+                series.index = series.index.tz_localize(None)
+            target[ticker] = series
+    return splits_by_ticker, dividends_by_ticker
 
 # --- REALIZED / UNREALIZED (running average-cost, chronological) ---
 def calc_realized_unrealized_avgcost(df):
@@ -867,40 +891,73 @@ with tabs[0]:
     selected_repo_files = st.multiselect("Select repository trade reports to include", repo_file_names, default=repo_file_names)
 
     st.subheader("Dhan API Data Fetching")
-    dhan_secret_token = st.secrets.get("DHAN_ACCESS_TOKEN", "") if hasattr(st, "secrets") else ""
+    dhan_client_id = st.secrets.get("DHAN_CLIENT_ID", "") if hasattr(st, "secrets") else ""
+    dhan_api_key = st.secrets.get("DHAN_API_KEY", "") if hasattr(st, "secrets") else ""
+    dhan_api_secret = st.secrets.get("DHAN_API_SECRET", "") if hasattr(st, "secrets") else ""
+    dhan_api_ready = bool(dhan_client_id and dhan_api_key and dhan_api_secret)
 
-    if "dhan_api_trades" not in st.session_state:
-        st.session_state["dhan_api_trades"] = None
+    for key in ("dhan_api_trades", "dhan_holdings", "dhan_session_token", "dhan_login_url"):
+        if key not in st.session_state:
+            st.session_state[key] = None
 
-    st.markdown("Generate a 24-hour access token at [web.dhan.co](https://web.dhan.co) under My Profile > Access DhanHQ APIs.")
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        dhan_input_token = st.text_input("Enter Dhan Access Token", type="password", help="Overrides DHAN_ACCESS_TOKEN from Streamlit secrets, if set.")
-    with col2:
-        st.write("") # spacer
-        st.write("")
-        fetch_clicked = st.button("Fetch Dhan Trades")
+    def load_dhan_data(access_token):
+        """Fetch Dhan trades and holdings into the session."""
+        with st.spinner("Fetching trades from Dhan..."):
+            try:
+                df_trades = fetch_dhan_trades(access_token, DHAN_START_DATE, user_mappings)
+                if df_trades.empty:
+                    st.warning("No equity trades found for this period.")
+                    return
+                st.session_state["dhan_api_trades"] = df_trades
+                st.success(f"Successfully fetched {len(df_trades)} trades from Dhan since {DHAN_START_DATE}.")
+            except Exception as e:
+                st.error(f"Dhan Fetch Error: {str(e)}")
+                return
+            try:
+                st.session_state["dhan_holdings"] = fetch_dhan_holdings(access_token)
+            except Exception as e:
+                st.session_state["dhan_holdings"] = None
+                st.warning(f"Could not check quantities against Dhan holdings: {str(e)}")
 
-    dhan_access_token = dhan_input_token.strip() or dhan_secret_token
-    if fetch_clicked:
-        if not dhan_access_token:
-            st.warning("Enter a Dhan access token first.")
+    # Dhan redirects back here with a tokenId after the browser login
+    dhan_token_id = st.query_params.get("tokenId")
+    dhan_just_logged_in = False
+    if dhan_token_id and dhan_api_ready:
+        try:
+            st.session_state["dhan_session_token"] = exchange_dhan_token_id(dhan_token_id, dhan_api_key, dhan_api_secret)
+            dhan_just_logged_in = True
+        except Exception as e:
+            st.error(f"Dhan Login Error: {str(e)}")
+        del st.query_params["tokenId"]
+
+    if dhan_api_ready:
+        if st.button("Login to Dhan"):
+            try:
+                st.session_state["dhan_login_url"] = generate_dhan_login_url(dhan_client_id, dhan_api_key, dhan_api_secret)
+            except Exception as e:
+                st.error(f"Dhan Login Error: {str(e)}")
+        if st.session_state["dhan_login_url"]:
+            st.link_button("Open Dhan login page", st.session_state["dhan_login_url"])
+    else:
+        st.info("Set DHAN_CLIENT_ID, DHAN_API_KEY and DHAN_API_SECRET in Streamlit secrets to enable Dhan login.")
+
+    with st.expander("Or paste a 24-hour access token from web.dhan.co"):
+        dhan_input_token = st.text_input("Enter Dhan Access Token", type="password")
+
+    dhan_access_token = dhan_input_token.strip() or st.session_state["dhan_session_token"]
+    if dhan_just_logged_in:
+        load_dhan_data(dhan_access_token)
+    if st.button("Fetch Dhan Trades"):
+        if dhan_access_token:
+            load_dhan_data(dhan_access_token)
         else:
-            with st.spinner("Fetching trades from Dhan..."):
-                try:
-                    df_trades = fetch_dhan_trades(dhan_access_token, DHAN_START_DATE, user_mappings)
-                    if not df_trades.empty:
-                        st.session_state["dhan_api_trades"] = df_trades
-                        st.success(f"Successfully fetched {len(df_trades)} trades from Dhan since {DHAN_START_DATE}.")
-                    else:
-                        st.warning("No equity trades found for this period.")
-                except Exception as e:
-                    st.error(f"Dhan Fetch Error: {str(e)}")
+            st.warning("Login to Dhan or paste an access token first.")
 
     if st.session_state["dhan_api_trades"] is not None:
         st.success("Dhan trades ready to be merged.")
         if st.button("Clear Dhan Data"):
             st.session_state["dhan_api_trades"] = None
+            st.session_state["dhan_holdings"] = None
             st.rerun()
 
     st.markdown("---")
@@ -954,6 +1011,27 @@ with tabs[0]:
             st.success("All scrip codes mapped.")
 
         mapped = trades[trades["yahoo_ticker"] != ""].copy()
+
+        # Dhan reports no bonuses or splits, so add them from Yahoo
+        if "Source" in mapped.columns:
+            dhan_mapped = mapped[mapped["Source"] == "Dhan"]
+            if not dhan_mapped.empty:
+                dhan_tickers = tuple(sorted(dhan_mapped["yahoo_ticker"].unique()))
+                dhan_splits, _ = fetch_corporate_actions(dhan_tickers)
+                dhan_bonus = bonus_rows(dhan_mapped, dhan_splits)
+                if not dhan_bonus.empty:
+                    mapped = pd.concat([mapped, dhan_bonus], ignore_index=True)
+                    dhan_mapped = pd.concat([dhan_mapped, dhan_bonus], ignore_index=True)
+                    st.subheader("Bonuses and Splits Added from Yahoo")
+                    st.dataframe(dhan_bonus[["date", "company_name", "yahoo_ticker", "quantity"]])
+                if st.session_state["dhan_holdings"] is not None:
+                    dhan_diff = holdings_mismatches(dhan_mapped, st.session_state["dhan_holdings"], pd.Timestamp(datetime.date.today()))
+                    if dhan_diff.empty:
+                        st.success("Dhan quantities match your Dhan holdings.")
+                    else:
+                        st.warning("These quantities differ from your Dhan holdings. Possible causes: an unmapped stock, a bonus not yet credited, or a demerger.")
+                        st.dataframe(dhan_diff)
+
         st.subheader("Mapped Trades (preview)")
         st.dataframe(mapped.head(20))
 
@@ -1019,12 +1097,27 @@ with tabs[1]:
     realized_pct = (total_realized / net_invested * 100.0) if net_invested > 0 else None
     unrealized_pct = (total_unrealized / net_invested * 100.0) if net_invested > 0 else None
 
+    # Dividends on Dhan holdings (estimated from Yahoo, as Dhan does not report them)
+    dividends_df = pd.DataFrame()
+    if "Source" in history_df.columns:
+        dhan_history = history_df[history_df["Source"] == "Dhan"].copy()
+        if not dhan_history.empty:
+            dhan_history["date"] = dhan_history["date"].dt.normalize()
+            dhan_splits, dhan_dividends = fetch_corporate_actions(tuple(sorted(dhan_history["yahoo_ticker"].dropna().unique())))
+            dividends_df = dividend_rows(dhan_history, dhan_dividends, dhan_splits, pd.Timestamp(datetime.date.today()))
+    total_dividends = dividends_df["Amount"].sum() if not dividends_df.empty else 0.0
+    total_return_amt += total_dividends
+    total_return_pct = (total_return_amt / net_invested * 100.0) if net_invested > 0 else None
+
     # XIRR
     cashflows = build_cashflows_from_history(history_df)
     irr_str = "<span style='color:gray;'>N/A</span>"
     if cashflows:
         amounts = [amt for amt, _ in cashflows]
         dates = [dt for _, dt in cashflows]
+        if not dividends_df.empty:
+            amounts.extend(dividends_df["Amount"].tolist())
+            dates.extend(dividends_df["Ex-Date"].tolist())
         today = pd.Timestamp(datetime.date.today())
         amounts.append(curr_value)
         dates.append(today)
@@ -1088,7 +1181,7 @@ with tabs[1]:
         latest = pnl_ts.iloc[-1]
         total_realized = latest["realized_cum"]
         total_unrealized = latest["unrealized_est"]
-        total_return_amt = latest["total_pnl"]
+        total_return_amt = latest["total_pnl"] + total_dividends
         total_return_pct = (total_return_amt / net_invested * 100.0) if net_invested > 0 else None
         realized_pct = (total_realized / net_invested * 100.0) if net_invested > 0 else None
         unrealized_pct = (total_unrealized / net_invested * 100.0) if net_invested > 0 else None
@@ -1135,7 +1228,7 @@ with tabs[1]:
 
     st.markdown("---")
     st.subheader("Total Return & Split")
-    colA, colB, colC = st.columns(3)
+    colA, colB, colC, colD = st.columns(4)
     with colA:
         st.markdown("Total Return (₹)")
         st.markdown(f"**{inr_format(total_return_amt)}**")
@@ -1151,6 +1244,15 @@ with tabs[1]:
         st.markdown(f"**{inr_format(total_unrealized)}**")
         if unrealized_pct is not None:
             st.markdown(f"({color_pct_html(unrealized_pct)})", unsafe_allow_html=True)
+    with colD:
+        st.markdown("Dividends (₹)")
+        st.markdown(f"**{inr_format(total_dividends)}**")
+    if not dividends_df.empty:
+        with st.expander("Dividend details (Dhan holdings, gross of TDS, estimated from Yahoo)"):
+            st.dataframe(dividends_df.sort_values("Ex-Date", ascending=False).assign(
+                Amount=lambda d: d["Amount"].round(2),
+                **{"Ex-Date": lambda d: d["Ex-Date"].dt.strftime("%Y-%m-%d")},
+            ), use_container_width=True)
 
     st.markdown("---")
 

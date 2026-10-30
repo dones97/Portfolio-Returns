@@ -6,6 +6,7 @@ import pandas as pd
 import requests
 
 DHAN_API_URL = "https://api.dhan.co/v2"
+DHAN_AUTH_URL = "https://auth.dhan.co"
 DHAN_SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 # Dhan's history endpoint does not document a page size, so stop on an empty page.
 DHAN_MAX_PAGES = 1000
@@ -13,7 +14,7 @@ DHAN_EQUITY_SEGMENTS = {"NSE_EQ": "NSE", "BSE_EQ": "BSE"}
 TRADE_COLUMNS = [
     "date", "company_name", "Amount", "Exchange", "Segment", "scrip_code",
     "Instrument Type", "Strike Price", "Expiry", "Trade Num", "Trade Time",
-    "side", "quantity", "price",
+    "side", "quantity", "price", "isin", "Source",
 ]
 
 
@@ -23,6 +24,31 @@ def _clean(value):
         return ""
     value = str(value).strip()
     return "" if value.upper() == "NA" else value
+
+
+def generate_dhan_login_url(client_id, api_key, api_secret):
+    """Start a consent session and return the browser login URL for it."""
+    resp = requests.post(
+        f"{DHAN_AUTH_URL}/app/generate-consent",
+        params={"client_id": client_id},
+        headers={"app_id": api_key, "app_secret": api_secret},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    consent_id = resp.json()["consentAppId"]
+    return f"{DHAN_AUTH_URL}/login/consentApp-login?consentAppId={consent_id}"
+
+
+def exchange_dhan_token_id(token_id, api_key, api_secret):
+    """Exchange the tokenId from the login redirect for an access token."""
+    resp = requests.get(
+        f"{DHAN_AUTH_URL}/app/consumeApp-consent",
+        params={"tokenId": token_id},
+        headers={"app_id": api_key, "app_secret": api_secret},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["accessToken"]
 
 
 def _get_json(url, access_token):
@@ -57,6 +83,11 @@ def fetch_dhan_trade_records(access_token, start_date, end_date):
         key = (r.get("exchangeSegment"), r.get("orderId"), r.get("exchangeTradeId"))
         unique.setdefault(key, r)
     return list(unique.values())
+
+
+def fetch_dhan_holdings(access_token):
+    """Fetch current holdings, used to check the quantities built from trades."""
+    return _get_json(f"{DHAN_API_URL}/holdings", access_token)
 
 
 def fetch_dhan_scrip_master():
@@ -143,6 +174,8 @@ def dhan_trades_to_report(records, master, user_mappings):
             "side": _clean(r.get("transactionType")).capitalize(),
             "quantity": quantity,
             "price": price,
+            "isin": isin,
+            "Source": "Dhan",
         })
     return pd.DataFrame(rows, columns=TRADE_COLUMNS)
 
