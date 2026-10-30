@@ -1,8 +1,9 @@
-"""Derive bonus/split rows, dividends and holding checks for Dhan trades.
+"""Derive bonus/split rows, dividends and holding checks from Yahoo's history.
 
 Dhan's APIs report neither corporate actions nor dividends, so these use Yahoo's
 per-ticker history. Yahoo records bonuses as splits (a 1:1 bonus has ratio 2).
-Upstox trades are excluded: those reports already carry their own BONUS rows.
+Bonus rows are for Dhan trades only, as the Upstox reports carry their own.
+Dividends cover the whole trade history, whichever broker held the shares.
 """
 import math
 
@@ -49,14 +50,14 @@ def bonus_rows(dhan_trades, splits_by_ticker):
     return pd.DataFrame(rows, columns=dhan_trades.columns)
 
 
-def dividend_rows(dhan_trades, dividends_by_ticker, splits_by_ticker, as_of):
+def dividend_rows(trades_df, dividends_by_ticker, splits_by_ticker, as_of):
     """Estimate gross dividends received, one row per ticker and ex-date.
 
     Yahoo restates past dividends for later splits, so the per-share amount is
     scaled back up to what was paid on the shares held at the time.
     """
     rows = []
-    for ticker, trades in dhan_trades.groupby("yahoo_ticker"):
+    for ticker, trades in trades_df.groupby("yahoo_ticker"):
         dividends = dividends_by_ticker.get(ticker)
         if dividends is None:
             continue

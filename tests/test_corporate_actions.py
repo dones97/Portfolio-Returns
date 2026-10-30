@@ -67,6 +67,23 @@ def test_dividend_uses_quantity_on_ex_date_and_skips_future_dates():
     assert rows["Amount"].tolist() == [20.0, 51.0]
 
 
+def test_dividend_uses_quantity_across_both_brokers_and_zero_priced_bonus():
+    df = trades(
+        ("2021-01-01", "Buy", 10),
+        ("2021-02-01", "Buy", 10),
+        ("2022-10-15", "Sell", 20),
+        ("2022-10-16", "Buy", 20),
+    )
+    df.loc[1, "price"] = 0.0
+    df["Source"] = [None, None, None, "Dhan"]
+    dividends = series(d_2021_03_01=1.0, d_2022_10_16=5.0, d_2022_12_01=2.0)
+    rows = ca.dividend_rows(
+        df, {"ABC.NS": dividends}, {}, pd.Timestamp("2023-01-01")
+    )
+    # Nothing is held on the ex-date falling between the sale and the rebuy
+    assert rows["Amount"].tolist() == [20.0, 40.0]
+
+
 def test_dividend_is_scaled_back_up_for_later_split():
     df = trades(("2026-10-16", "Buy", 10))
     rows = ca.dividend_rows(

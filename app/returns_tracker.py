@@ -7,6 +7,7 @@ from glob import glob
 import numpy as np
 import datetime
 import bisect
+from concurrent.futures import ThreadPoolExecutor
 import altair as alt
 from corporate_actions import bonus_rows, dividend_rows, holdings_mismatches
 from dhan_client import (
@@ -336,21 +337,33 @@ def fetch_all_historical_prices(ticker_tuple, start_date_str, end_date_str):
 
 @st.cache_data(ttl=3600, show_spinner="Fetching corporate actions from Yahoo...")
 def fetch_corporate_actions(ticker_tuple):
-    """Fetch per-ticker splits and dividends, with timezones removed."""
-    splits_by_ticker, dividends_by_ticker = {}, {}
-    for ticker in ticker_tuple:
+    """Fetch per-ticker splits and dividends, with timezones removed.
+
+    Also returns the tickers Yahoo has no data for, whose actions are unknown.
+    """
+    def fetch_one(ticker):
         try:
             yf_ticker = yf.Ticker(ticker)
-            splits = yf_ticker.splits
-            dividends = yf_ticker.dividends
+            if yf_ticker.history(period="max").empty:
+                return None
+            return yf_ticker.splits, yf_ticker.dividends
         except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(fetch_one, ticker_tuple))
+
+    splits_by_ticker, dividends_by_ticker, unavailable = {}, {}, []
+    for ticker, result in zip(ticker_tuple, results):
+        if result is None:
+            unavailable.append(ticker)
             continue
-        for series, target in ((splits, splits_by_ticker), (dividends, dividends_by_ticker)):
+        for series, target in zip(result, (splits_by_ticker, dividends_by_ticker)):
             if getattr(series.index, "tz", None) is not None:
                 series = series.copy()
                 series.index = series.index.tz_localize(None)
             target[ticker] = series
-    return splits_by_ticker, dividends_by_ticker
+    return splits_by_ticker, dividends_by_ticker, unavailable
 
 # --- REALIZED / UNREALIZED (running average-cost, chronological) ---
 def calc_realized_unrealized_avgcost(df):
@@ -1017,7 +1030,7 @@ with tabs[0]:
             dhan_mapped = mapped[mapped["Source"] == "Dhan"]
             if not dhan_mapped.empty:
                 dhan_tickers = tuple(sorted(dhan_mapped["yahoo_ticker"].unique()))
-                dhan_splits, _ = fetch_corporate_actions(dhan_tickers)
+                dhan_splits, _, _ = fetch_corporate_actions(dhan_tickers)
                 dhan_bonus = bonus_rows(dhan_mapped, dhan_splits)
                 if not dhan_bonus.empty:
                     mapped = pd.concat([mapped, dhan_bonus], ignore_index=True)
@@ -1097,14 +1110,11 @@ with tabs[1]:
     realized_pct = (total_realized / net_invested * 100.0) if net_invested > 0 else None
     unrealized_pct = (total_unrealized / net_invested * 100.0) if net_invested > 0 else None
 
-    # Dividends on Dhan holdings (estimated from Yahoo, as Dhan does not report them)
-    dividends_df = pd.DataFrame()
-    if "Source" in history_df.columns:
-        dhan_history = history_df[history_df["Source"] == "Dhan"].copy()
-        if not dhan_history.empty:
-            dhan_history["date"] = dhan_history["date"].dt.normalize()
-            dhan_splits, dhan_dividends = fetch_corporate_actions(tuple(sorted(dhan_history["yahoo_ticker"].dropna().unique())))
-            dividends_df = dividend_rows(dhan_history, dhan_dividends, dhan_splits, pd.Timestamp(datetime.date.today()))
+    # Dividends on all holdings (estimated from Yahoo, as neither broker's data has them)
+    dividend_history = history_df[history_df["yahoo_ticker"].fillna("").astype(str).str.strip() != ""].copy()
+    dividend_history["date"] = dividend_history["date"].dt.normalize()
+    history_splits, history_dividends, dividends_unavailable = fetch_corporate_actions(tuple(sorted(dividend_history["yahoo_ticker"].unique())))
+    dividends_df = dividend_rows(dividend_history, history_dividends, history_splits, pd.Timestamp(datetime.date.today()))
     total_dividends = dividends_df["Amount"].sum() if not dividends_df.empty else 0.0
     total_return_amt += total_dividends
     total_return_pct = (total_return_amt / net_invested * 100.0) if net_invested > 0 else None
@@ -1248,7 +1258,9 @@ with tabs[1]:
         st.markdown("Dividends (₹)")
         st.markdown(f"**{inr_format(total_dividends)}**")
     if not dividends_df.empty:
-        with st.expander("Dividend details (Dhan holdings, gross of TDS, estimated from Yahoo)"):
+        with st.expander("Dividend details (all holdings, gross of TDS, estimated from Yahoo)"):
+            if dividends_unavailable:
+                st.caption(f"No Yahoo data, so not counted: {', '.join(dividends_unavailable)}")
             st.dataframe(dividends_df.sort_values("Ex-Date", ascending=False).assign(
                 Amount=lambda d: d["Amount"].round(2),
                 **{"Ex-Date": lambda d: d["Ex-Date"].dt.strftime("%Y-%m-%d")},
