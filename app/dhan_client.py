@@ -26,6 +26,23 @@ def _clean(value):
     return "" if value.upper() == "NA" else value
 
 
+def _raise_for_dhan_error(resp):
+    """Raise on a failed response, keeping the reason Dhan gives in its body."""
+    if resp.ok:
+        return
+    try:
+        body = resp.json()
+        reason = f"{body['errorCode']}: {body['errorMessage']}"
+    except (ValueError, KeyError, TypeError):
+        reason = resp.text[:300]
+    raise ValueError(f"Dhan returned HTTP {resp.status_code}. {reason}")
+
+
+def extract_dhan_token_id(pasted):
+    """Return the tokenId from a pasted login code or full redirect URL."""
+    return pasted.strip().split("tokenId=")[-1].split("&")[0]
+
+
 def generate_dhan_login_url(client_id, api_key, api_secret):
     """Start a consent session and return the browser login URL for it."""
     resp = requests.post(
@@ -34,7 +51,7 @@ def generate_dhan_login_url(client_id, api_key, api_secret):
         headers={"app_id": api_key, "app_secret": api_secret},
         timeout=30,
     )
-    resp.raise_for_status()
+    _raise_for_dhan_error(resp)
     consent_id = resp.json()["consentAppId"]
     return f"{DHAN_AUTH_URL}/login/consentApp-login?consentAppId={consent_id}"
 
@@ -47,7 +64,7 @@ def exchange_dhan_token_id(token_id, api_key, api_secret):
         headers={"app_id": api_key, "app_secret": api_secret},
         timeout=30,
     )
-    resp.raise_for_status()
+    _raise_for_dhan_error(resp)
     return resp.json()["accessToken"]
 
 
@@ -55,7 +72,7 @@ def _get_json(url, access_token):
     """GET a Dhan endpoint and return its JSON list of records."""
     headers = {"Accept": "application/json", "access-token": access_token}
     resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
+    _raise_for_dhan_error(resp)
     data = resp.json()
     if not isinstance(data, list):
         raise ValueError(f"Unexpected Dhan response: {data}")
@@ -93,7 +110,7 @@ def fetch_dhan_holdings(access_token):
 def fetch_dhan_scrip_master():
     """Download the equity rows of Dhan's scrip master."""
     resp = requests.get(DHAN_SCRIP_MASTER_URL, timeout=120)
-    resp.raise_for_status()
+    _raise_for_dhan_error(resp)
     master = pd.read_csv(
         io.BytesIO(resp.content),
         dtype=str,

@@ -1,4 +1,5 @@
 """Tests for the Dhan trade fetch and conversion, using no network access."""
+import json
 import os
 import sys
 
@@ -124,3 +125,33 @@ def test_fetch_failure_propagates_instead_of_returning_partial(monkeypatch):
     monkeypatch.setattr(dhan_client, "_get_json", fail_on_second_page)
     with pytest.raises(ConnectionError):
         dhan_client.fetch_dhan_trade_records("t", "2026-04-01", "2026-10-30")
+
+
+class FakeResponse:
+    """A failed response with a JSON or plain text body."""
+
+    ok = False
+    status_code = 400
+
+    def __init__(self, text):
+        self.text = text
+
+    def json(self):
+        return json.loads(self.text)
+
+
+def test_failure_message_keeps_the_reason_from_dhan():
+    body = '{"errorCode": "DH-907", "errorMessage": "No data present"}'
+    with pytest.raises(ValueError, match="HTTP 400. DH-907: No data present"):
+        dhan_client._raise_for_dhan_error(FakeResponse(body))
+
+
+def test_failure_message_handles_non_json_body():
+    with pytest.raises(ValueError, match="HTTP 400. Bad gateway"):
+        dhan_client._raise_for_dhan_error(FakeResponse("Bad gateway"))
+
+
+def test_login_code_can_be_pasted_alone_or_as_the_redirect_url():
+    assert dhan_client.extract_dhan_token_id(" abc-123 \n") == "abc-123"
+    url = "https://app.streamlit.app/?tokenId=abc-123&other=1"
+    assert dhan_client.extract_dhan_token_id(url) == "abc-123"

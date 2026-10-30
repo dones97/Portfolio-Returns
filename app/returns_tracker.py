@@ -17,6 +17,7 @@ from corporate_actions import (
 )
 from dhan_client import (
     exchange_dhan_token_id,
+    extract_dhan_token_id,
     fetch_dhan_holdings,
     fetch_dhan_trades,
     generate_dhan_login_url,
@@ -934,15 +935,30 @@ with tabs[0]:
                 st.session_state["dhan_holdings"] = None
                 st.warning(f"Could not check quantities against Dhan holdings: {str(e)}")
 
-    # Dhan redirects back here with a tokenId after the browser login
+    def complete_dhan_login(token_id):
+        """Exchange a login code for an access token, returning whether it worked."""
+        try:
+            st.session_state["dhan_session_token"] = exchange_dhan_token_id(token_id, dhan_api_key, dhan_api_secret)
+            st.session_state["dhan_login_url"] = None
+            return True
+        except Exception as e:
+            st.error(f"Dhan Login Error: {str(e)}")
+            return False
+
+    # Dhan redirects to a new tab with a tokenId after the browser login.
+    # Show it for copying back to the original window, and stop here so this tab stays light.
     dhan_token_id = st.query_params.get("tokenId")
     dhan_just_logged_in = False
     if dhan_token_id and dhan_api_ready:
-        try:
-            st.session_state["dhan_session_token"] = exchange_dhan_token_id(dhan_token_id, dhan_api_key, dhan_api_secret)
-            dhan_just_logged_in = True
-        except Exception as e:
-            st.error(f"Dhan Login Error: {str(e)}")
+        dhan_login_notice = st.empty()
+        with dhan_login_notice.container():
+            st.success("Dhan login complete. Copy this login code, paste it into your original app window, then close this tab.")
+            st.code(dhan_token_id, language=None)
+            continue_here = st.button("Continue in this window instead")
+        if not continue_here:
+            st.stop()
+        dhan_login_notice.empty()
+        dhan_just_logged_in = complete_dhan_login(dhan_token_id)
         del st.query_params["tokenId"]
 
     if dhan_api_ready:
@@ -953,6 +969,12 @@ with tabs[0]:
                 st.error(f"Dhan Login Error: {str(e)}")
         if st.session_state["dhan_login_url"]:
             st.link_button("Open Dhan login page", st.session_state["dhan_login_url"])
+            dhan_login_code = st.text_input("Paste the login code shown after signing in")
+            if st.button("Complete Dhan Login"):
+                if dhan_login_code.strip():
+                    dhan_just_logged_in = complete_dhan_login(extract_dhan_token_id(dhan_login_code))
+                else:
+                    st.warning("Paste the login code first.")
     else:
         st.info("Set DHAN_CLIENT_ID, DHAN_API_KEY and DHAN_API_SECRET in Streamlit secrets to enable Dhan login.")
 
