@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import yfinance as yf
@@ -7,8 +8,7 @@ import numpy as np
 import datetime
 import bisect
 import altair as alt
-import requests
-import urllib.parse
+from dhan_client import fetch_dhan_trades
 
 # --- TRADE SORTING UTILITY ---
 def sort_trades_properly(df):
@@ -44,6 +44,8 @@ def sort_trades_properly(df):
 MAPPINGS_CSV = "ticker_mappings.csv"
 TRADE_REPORTS_DIR = "trade_reports"
 PORTFOLIO_HISTORY_CSV = "portfolio_history.csv"
+# Dhan trades are fetched from here on; earlier trades come from the Upstox reports
+DHAN_START_DATE = "2026-04-01"
 
 def get_financial_year(dt):
     """Given a date, return the start year of the financial year (e.g., 2022 for FY 2022-23)."""
@@ -56,73 +58,6 @@ def get_financial_year(dt):
 
 def format_fin_year(y):
     return f"{y}-{str(y+1)[-2:]}"
-
-def fetch_upstox_historical_trades(access_token, start_date, end_date):
-    """Fetch historical trades from Upstox API for given dates"""
-    url = "https://api.upstox.com/v2/charges/historical-trades"
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {access_token}"
-    }
-    all_records = []
-    page_number = 1
-    page_size = 3000
-    
-    while True:
-        params = {
-            "start_date": start_date,
-            "end_date": end_date,
-            "page_number": page_number,
-            "page_size": page_size
-        }
-        try:
-            resp = requests.get(url, headers=headers, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            records = data.get("data", [])
-            if not records:
-                break
-            all_records.extend(records)
-            if len(records) < page_size:
-                break
-            page_number += 1
-        except Exception as e:
-            st.error(f"Error fetching Upstox trades page {page_number}: {e}")
-            break
-            
-    if not all_records:
-        return pd.DataFrame()
-        
-    df = pd.DataFrame(all_records)
-    
-    mapped_df = pd.DataFrame()
-    if 'scrip_name' in df.columns:
-        mapped_df['scrip_code'] = df['scrip_name']
-    elif 'symbol' in df.columns:
-        mapped_df['scrip_code'] = df['symbol']
-    elif 'isin' in df.columns:
-        mapped_df['scrip_code'] = df['isin']
-    else:
-        mapped_df['scrip_code'] = 'Unknown'
-        
-    mapped_df['company_name'] = df.get('scrip_name', '')
-    mapped_df['quantity'] = df.get('quantity', 0)
-    mapped_df['price'] = df.get('price', 0.0)
-    mapped_df['side'] = df.get('transaction_type', '')
-    
-    if 'trade_date' in df.columns:
-        mapped_df['date'] = pd.to_datetime(df['trade_date'], errors='coerce')
-    else:
-        mapped_df['date'] = pd.NaT
-        
-    mapped_df['Amount'] = df.get('amount', 0.0)
-    mapped_df['Exchange'] = df.get('exchange', '')
-    mapped_df['Segment'] = df.get('segment', '')
-    mapped_df['Instrument Type'] = df.get('option_type', '')
-    mapped_df['Strike Price'] = df.get('strike_price', '')
-
-        
-    return mapped_df
 
 # --- Sharpe Ratio Utilities (Monthly Returns) ---
 
@@ -931,72 +866,48 @@ with tabs[0]:
     repo_file_names = [fname for fname, _ in repo_reports] if repo_reports else []
     selected_repo_files = st.multiselect("Select repository trade reports to include", repo_file_names, default=repo_file_names)
 
-    st.subheader("Upstox API Data Fetching")
-    upstox_api_key = st.secrets.get("UPSTOX_API_KEY", "") if hasattr(st, "secrets") else ""
-    upstox_api_secret = st.secrets.get("UPSTOX_API_SECRET", "") if hasattr(st, "secrets") else ""
-    upstox_redirect = st.secrets.get("UPSTOX_REDIRECT_URI", "") if hasattr(st, "secrets") else ""
+    st.subheader("Dhan API Data Fetching")
+    dhan_secret_token = st.secrets.get("DHAN_ACCESS_TOKEN", "") if hasattr(st, "secrets") else ""
 
-    if "upstox_api_trades" not in st.session_state:
-        st.session_state["upstox_api_trades"] = None
+    if "dhan_api_trades" not in st.session_state:
+        st.session_state["dhan_api_trades"] = None
 
-    if not upstox_api_key or not upstox_api_secret:
-        st.info("Set UPSTOX_API_KEY and UPSTOX_API_SECRET in Streamlit secrets to enable Upstox fetch.")
-    else:
-        auth_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={upstox_api_key}&redirect_uri={urllib.parse.quote(upstox_redirect)}"
-        st.markdown(f"[🔗 Login to Upstox (Get Code)]({auth_url})", unsafe_allow_html=True)
-        
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            auth_code = st.text_input("Enter Upstox Authorization Code", type="password")
-        with col2:
-            st.write("") # spacer
-            st.write("")
-            fetch_clicked = st.button("Fetch Current FY Trades")
-            
-        if fetch_clicked and auth_code:
-            with st.spinner("Authenticating & Fetching..."):
+    st.markdown("Generate a 24-hour access token at [web.dhan.co](https://web.dhan.co) under My Profile > Access DhanHQ APIs.")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        dhan_input_token = st.text_input("Enter Dhan Access Token", type="password", help="Overrides DHAN_ACCESS_TOKEN from Streamlit secrets, if set.")
+    with col2:
+        st.write("") # spacer
+        st.write("")
+        fetch_clicked = st.button("Fetch Dhan Trades")
+
+    dhan_access_token = dhan_input_token.strip() or dhan_secret_token
+    if fetch_clicked:
+        if not dhan_access_token:
+            st.warning("Enter a Dhan access token first.")
+        else:
+            with st.spinner("Fetching trades from Dhan..."):
                 try:
-                    token_url = "https://api.upstox.com/v2/login/authorization/token"
-                    headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
-                    payload = {
-                        "code": auth_code,
-                        "client_id": upstox_api_key,
-                        "client_secret": upstox_api_secret,
-                        "redirect_uri": upstox_redirect,
-                        "grant_type": "authorization_code"
-                    }
-                    resp = requests.post(token_url, headers=headers, data=payload)
-                    resp.raise_for_status()
-                    access_token = resp.json().get("access_token")
-                    
-                    if access_token:
-                        today = datetime.date.today()
-                        fy_start_year = get_financial_year(today)
-                        start_date = f"{fy_start_year}-04-01"
-                        end_date = today.strftime("%Y-%m-%d")
-                        
-                        df_trades = fetch_upstox_historical_trades(access_token, start_date, end_date)
-                        if df_trades is not None and not df_trades.empty:
-                            st.session_state["upstox_api_trades"] = df_trades
-                            st.success(f"Successfully fetched {len(df_trades)} trades from Upstox for {start_date} to {end_date}.")
-                        else:
-                            st.warning("No trades found for this period.")
+                    df_trades = fetch_dhan_trades(dhan_access_token, DHAN_START_DATE, user_mappings)
+                    if not df_trades.empty:
+                        st.session_state["dhan_api_trades"] = df_trades
+                        st.success(f"Successfully fetched {len(df_trades)} trades from Dhan since {DHAN_START_DATE}.")
                     else:
-                        st.error("Failed to get access token from response.")
+                        st.warning("No equity trades found for this period.")
                 except Exception as e:
-                    st.error(f"Upstox Auth/Fetch Error: {str(e)}")
-                    
-    if st.session_state["upstox_api_trades"] is not None:
-        st.success("Upstox trades ready to be merged.")
-        if st.button("Clear Upstox Data"):
-            st.session_state["upstox_api_trades"] = None
+                    st.error(f"Dhan Fetch Error: {str(e)}")
+
+    if st.session_state["dhan_api_trades"] is not None:
+        st.success("Dhan trades ready to be merged.")
+        if st.button("Clear Dhan Data"):
+            st.session_state["dhan_api_trades"] = None
             st.rerun()
 
     st.markdown("---")
 
     all_trades = []
-    if st.session_state.get("upstox_api_trades") is not None:
-        all_trades.append(st.session_state["upstox_api_trades"])
+    if st.session_state.get("dhan_api_trades") is not None:
+        all_trades.append(st.session_state["dhan_api_trades"])
 
     if uploaded_files:
         for file in uploaded_files:
