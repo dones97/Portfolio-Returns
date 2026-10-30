@@ -15,6 +15,7 @@ from corporate_actions import (
     holdings_mismatches,
     normalize_action_dates,
 )
+from github_sync import save_mappings_to_github
 from dhan_client import (
     exchange_dhan_token_id,
     extract_dhan_token_id,
@@ -57,6 +58,8 @@ def sort_trades_properly(df):
 MAPPINGS_CSV = "ticker_mappings.csv"
 TRADE_REPORTS_DIR = "trade_reports"
 PORTFOLIO_HISTORY_CSV = "portfolio_history.csv"
+GITHUB_REPO = "dones97/Portfolio-Returns"
+GITHUB_BRANCH = "main"
 # Dhan trades are fetched from here on; earlier trades come from the Upstox reports
 DHAN_START_DATE = "2026-04-01"
 
@@ -168,13 +171,33 @@ def load_user_mappings():
     if os.path.exists(MAPPINGS_CSV):
         df = pd.read_csv(MAPPINGS_CSV, dtype=str)
         df = df.dropna(subset=["scrip_code", "yahoo_ticker"])
-        return dict(zip(df["scrip_code"].str.strip(), df["yahoo_ticker"].str.strip()))
-    return {}
+        mappings = dict(zip(df["scrip_code"].str.strip(), df["yahoo_ticker"].str.strip()))
+    else:
+        mappings = {}
+    # Mappings committed to GitHub apply here before the app pulls that commit
+    mappings.update(st.session_state.get("session_mappings", {}))
+    return mappings
 
 def save_user_mappings(mapping_dict):
     df = pd.DataFrame([(code, ticker) for code, ticker in mapping_dict.items()],
                       columns=["scrip_code", "yahoo_ticker"])
     df.to_csv(MAPPINGS_CSV, index=False)
+
+def persist_mappings(new_mappings, all_mappings):
+    """Save new mappings to GitHub, falling back to local disk, and describe the result."""
+    st.session_state.setdefault("session_mappings", {}).update(new_mappings)
+    github_token = st.secrets.get("GITHUB_TOKEN", "") if hasattr(st, "secrets") else ""
+    names = ", ".join(sorted(new_mappings))
+    if not github_token:
+        save_user_mappings(all_mappings)
+        return "info", f"Saved {names} to ticker_mappings.csv in this app only. Set GITHUB_TOKEN in Streamlit secrets to keep mappings on GitHub."
+    try:
+        # The tracked file is left alone on success, so the app can pull this commit cleanly
+        save_mappings_to_github(github_token, GITHUB_REPO, GITHUB_BRANCH, MAPPINGS_CSV, new_mappings)
+        return "success", f"Saved {names} to GitHub."
+    except Exception as e:
+        save_user_mappings(all_mappings)
+        return "error", f"Could not save {names} to GitHub, so they will last only until the app restarts. {str(e)}"
 
 def default_bse_mapping(scrip_code):
     if pd.isnull(scrip_code):
@@ -1024,6 +1047,8 @@ with tabs[0]:
 
         unmapped = trades[trades["yahoo_ticker"] == ""][["scrip_code", "company_name"]].drop_duplicates()
         st.subheader("Unmapped Scrip Codes")
+        for notice_kind, notice_text in st.session_state.pop("mapping_notices", []):
+            getattr(st, notice_kind)(notice_text)
         if not unmapped.empty:
             edited = st.data_editor(unmapped.assign(yahoo_ticker=""), key="edit_tickers", num_rows="dynamic")
             if st.button("Update Mapping"):
@@ -1037,13 +1062,15 @@ with tabs[0]:
                             new_mappings[code] = ticker
                         else:
                             failed.append((code, ticker))
+                notices = []
                 if new_mappings:
                     user_mappings.update(new_mappings)
-                    save_user_mappings(user_mappings)
-                    st.success("Saved new mappings to ticker_mappings.csv. Reload to apply.")
-                if failed:
-                    for code, ticker in failed:
-                        st.warning(f"Ticker {ticker} for code {code} is not valid on Yahoo and was not saved.")
+                    notices.append(persist_mappings(new_mappings, user_mappings))
+                for code, ticker in failed:
+                    notices.append(("warning", f"Ticker {ticker} for code {code} is not valid on Yahoo and was not saved."))
+                if notices:
+                    st.session_state["mapping_notices"] = notices
+                    st.rerun()
         else:
             st.success("All scrip codes mapped.")
 
