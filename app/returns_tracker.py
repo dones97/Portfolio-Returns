@@ -15,7 +15,7 @@ from corporate_actions import (
     holdings_mismatches,
     normalize_action_dates,
 )
-from github_sync import save_mappings_to_github
+from github_sync import replace_file_on_github, save_mappings_to_github
 from dhan_client import (
     exchange_dhan_token_id,
     extract_dhan_token_id,
@@ -199,6 +199,48 @@ def persist_mappings(new_mappings, all_mappings):
         save_user_mappings(all_mappings)
         return "error", f"Could not save {names} to GitHub, so they will last only until the app restarts. {str(e)}"
 
+def prepare_history(df):
+    """Return trade history with parsed dates, raising ValueError if columns are missing."""
+    df = df.rename(columns={"Date": "date"})
+    if "date" not in df.columns:
+        raise ValueError("Portfolio data is missing the 'date' column.")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", format="mixed")
+    df = df.dropna(subset=["date"])
+    required_cols = {"yahoo_ticker", "side", "quantity", "price", "date"}
+    if not required_cols.issubset(set(df.columns)):
+        raise ValueError(f"Portfolio data is missing columns: {required_cols - set(df.columns)}")
+    return df
+
+def load_stored_history():
+    """Return the stored portfolio data, or None if nothing is stored yet."""
+    # Data stored this session applies here before the app pulls that commit
+    if st.session_state.get("stored_history") is not None:
+        return st.session_state["stored_history"].copy()
+    if not os.path.exists(PORTFOLIO_HISTORY_CSV):
+        return None
+    return pd.read_csv(PORTFOLIO_HISTORY_CSV, dtype={"scrip_code": str})
+
+def store_history(history_df):
+    """Replace the stored portfolio data on GitHub, falling back to local disk, and describe the result."""
+    last_date = pd.to_datetime(history_df["date"]).max().strftime("%d %b %Y")
+    summary = f"{len(history_df)} trades up to {last_date}"
+    csv_text = history_df.to_csv(index=False)
+    github_token = st.secrets.get("GITHUB_TOKEN", "") if hasattr(st, "secrets") else ""
+    try:
+        if not github_token:
+            with open(PORTFOLIO_HISTORY_CSV, "w", encoding="utf-8", newline="") as f:
+                f.write(csv_text)
+            result = ("info", f"Stored {summary} in {PORTFOLIO_HISTORY_CSV} in this app only. Set GITHUB_TOKEN in Streamlit secrets to keep it on GitHub.")
+        else:
+            # The tracked file is left alone, so the app can pull this commit cleanly
+            replace_file_on_github(github_token, GITHUB_REPO, GITHUB_BRANCH, PORTFOLIO_HISTORY_CSV,
+                                   csv_text, f"Store portfolio trade data ({summary})")
+            result = ("success", f"Stored {summary} on GitHub.")
+    except Exception as e:
+        return "error", f"Could not store the portfolio data, so the previous data is still in use. {str(e)}"
+    st.session_state["stored_history"] = history_df.copy()
+    return result
+
 def default_bse_mapping(scrip_code):
     if pd.isnull(scrip_code):
         return None
@@ -288,56 +330,41 @@ def color_pct_html(pct):
     color = "green" if pct >= 0 else "red"
     return f"<span style='color:{color}; font-weight:bold'>{round(pct,2)}%</span>"
 
-# --- PRICE LOOKUP (cached) ---
-_price_cache = {}
-
+# --- PRICE LOOKUP (cached across reruns and sessions) ---
 def get_prev_trading_price(ticker, target_date):
-    if not isinstance(target_date, (pd.Timestamp, datetime.date, datetime.datetime)):
-        target_date = pd.to_datetime(target_date)
-    target_day = pd.Timestamp(target_date).normalize()
-    key = ("hist", ticker, target_day.strftime("%Y-%m-%d"))
-    if key in _price_cache:
-        return _price_cache[key]
+    target_day = pd.Timestamp(pd.to_datetime(target_date)).normalize()
+    return _prev_trading_price(ticker, target_day.strftime("%Y-%m-%d"))
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _prev_trading_price(ticker, target_day_str):
+    target_day = pd.Timestamp(target_day_str)
     # wider window for safety
     start = (target_day - pd.Timedelta(days=40)).strftime("%Y-%m-%d")
     end = (target_day + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     try:
         hist = yf.Ticker(ticker).history(start=start, end=end)
         if hist is None or hist.empty:
-            _price_cache[key] = None
             return None
         hist = hist[hist.index <= target_day]
         hist = hist.dropna(subset=["Close"])
         if hist.empty:
-            _price_cache[key] = None
             return None
-        price = float(hist.iloc[-1]["Close"])
-        _price_cache[key] = price
-        return price
+        return float(hist.iloc[-1]["Close"])
     except Exception:
-        _price_cache[key] = None
         return None
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_current_price(ticker):
-    key = ("cur", ticker)
-    if key in _price_cache:
-        return _price_cache[key]
     try:
         hist = yf.Ticker(ticker).history(period="5d")
         if hist is not None and not hist.empty:
             hist = hist.dropna(subset=["Close"])
             if hist.empty:
-                _price_cache[key] = None
                 return None
-            price = float(hist.iloc[-1]["Close"])
-            _price_cache[key] = price
-            return price
+            return float(hist.iloc[-1]["Close"])
         info = yf.Ticker(ticker).info
-        price = info.get("regularMarketPrice", None)
-        _price_cache[key] = price
-        return price
+        return info.get("regularMarketPrice", None)
     except Exception:
-        _price_cache[key] = None
         return None
 
 @st.cache_data(ttl=3600, show_spinner="Fetching historical prices for portfolio timeline...")
@@ -918,6 +945,8 @@ st.set_page_config(page_title="Portfolio Returns Tracker", layout="wide")
 st.title("Portfolio Returns")
 
 tabs = st.tabs(["Trade Mapping", "Portfolio Returns"])
+# Trades imported this session; the stored data is used when this stays None
+session_history = None
 
 with tabs[0]:
     st.markdown("Upload or select trade reports, map scrip codes to Yahoo tickers, and save the portfolio history.", unsafe_allow_html=True)
@@ -1026,6 +1055,9 @@ with tabs[0]:
     if st.session_state.get("dhan_api_trades") is not None:
         all_trades.append(st.session_state["dhan_api_trades"])
 
+    # Repository reports alone are already in the stored data, so only these count as an import
+    imported_trades = bool(st.session_state.get("dhan_api_trades") is not None or uploaded_files)
+
     if uploaded_files:
         for file in uploaded_files:
             try:
@@ -1099,15 +1131,33 @@ with tabs[0]:
         st.subheader("Mapped Trades (preview)")
         st.dataframe(mapped.head(20))
 
+        # Imported trades replace the stored data on the Portfolio Returns tab
+        if imported_trades and not mapped.empty:
+            session_history = mapped
+
         st.markdown("---")
-        st.subheader("Save Portfolio History")
-        overwrite = st.checkbox("Overwrite existing portfolio_history.csv", value=False)
-        if st.button("Save Portfolio History to CSV"):
-            if os.path.exists(PORTFOLIO_HISTORY_CSV) and not overwrite:
-                st.warning("portfolio_history.csv already exists. Check the overwrite box to overwrite.")
-            else:
-                mapped.to_csv(PORTFOLIO_HISTORY_CSV, index=False)
-                st.success("Saved portfolio_history.csv.")
+        st.subheader("Store Portfolio Trade Data")
+        for notice_kind, notice_text in st.session_state.pop("store_notices", []):
+            getattr(st, notice_kind)(notice_text)
+        stored_last = None
+        try:
+            stored_now = load_stored_history()
+            if stored_now is not None:
+                stored_now = prepare_history(stored_now)
+                stored_last = stored_now["date"].max() if not stored_now.empty else None
+        except Exception as e:
+            st.warning(f"Could not read the stored portfolio data. {str(e)}")
+        if stored_last is not None:
+            st.caption(f"Stored now: {len(stored_now)} trades up to {stored_last:%d %b %Y}.")
+        if not mapped.empty:
+            new_last = pd.to_datetime(mapped["date"]).max()
+            st.caption(f"Storing replaces it with these {len(mapped)} mapped trades up to {new_last:%d %b %Y}. "
+                       "Unmapped trades are not stored.")
+            if stored_last is not None and new_last < stored_last:
+                st.warning("These trades end before the stored data does. Check that all reports are included before storing.")
+            if st.button("Store Portfolio Trade Data"):
+                st.session_state["store_notices"] = [store_history(mapped)]
+                st.rerun()
     else:
         st.info("Upload trades or pick from repository to begin.")
 
@@ -1119,22 +1169,28 @@ with tabs[0]:
 with tabs[1]:
     st.header("Portfolio Returns")
 
-    if not os.path.exists(PORTFOLIO_HISTORY_CSV):
-        st.warning("No portfolio_history.csv found. Save mapped trades first.")
+    try:
+        history_df = session_history.copy() if session_history is not None else load_stored_history()
+        if history_df is None:
+            st.warning("No stored portfolio data found. Import and map trades, then store them on the Trade Mapping tab.")
+            st.stop()
+        history_df = prepare_history(history_df)
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
+    if history_df.empty:
+        st.warning("The portfolio data has no trades with valid dates.")
         st.stop()
 
-    history_df = pd.read_csv(PORTFOLIO_HISTORY_CSV)
-    if "Date" in history_df.columns:
-        history_df = history_df.rename(columns={"Date": "date"})
-    if "date" not in history_df.columns:
-        st.error("portfolio_history.csv missing 'date' column.")
-        st.stop()
-    history_df["date"] = pd.to_datetime(history_df["date"], errors="coerce", format="mixed")
-    history_df = history_df.dropna(subset=["date"])
-    required_cols = {"yahoo_ticker", "side", "quantity", "price", "date"}
-    if not required_cols.issubset(set(history_df.columns)):
-        st.error(f"portfolio_history.csv missing columns: {required_cols - set(history_df.columns)}")
-        st.stop()
+    last_trade_label = history_df["date"].max().strftime("%d %b %Y")
+    if session_history is None:
+        st.info(f"Showing stored portfolio data: {len(history_df)} trades up to **{last_trade_label}**. "
+                "Prices are as of today.")
+    elif session_history.equals(st.session_state.get("stored_history")):
+        st.info(f"Showing trades imported this session, now stored: {len(history_df)} trades up to **{last_trade_label}**.")
+    else:
+        st.info(f"Showing trades imported this session: {len(history_df)} trades up to **{last_trade_label}**. "
+                "Use Store Portfolio Trade Data on the Trade Mapping tab to keep them for next time.")
 
     # Re-apply current ticker mappings to refresh any stale yahoo_ticker values
     current_mappings = load_user_mappings()

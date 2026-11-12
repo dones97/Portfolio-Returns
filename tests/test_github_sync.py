@@ -90,3 +90,54 @@ def test_commit_failure_reports_the_reason_from_github():
         put.return_value = response(403, {"message": "Resource not accessible"})
         with pytest.raises(ValueError, match="HTTP 403. Resource not accessible"):
             github_sync.save_mappings_to_github(*ARGS, {"KRN": "KRN.NS"})
+
+
+HISTORY_ARGS = ("token", "owner/repo", "main", "portfolio_history.csv")
+
+
+def test_replace_overwrites_the_file_with_the_sha_it_read():
+    text = "date,side\n2026-04-01,Buy\n"
+    with mock.patch.object(github_sync.requests, "get") as get, mock.patch.object(
+        github_sync.requests, "put"
+    ) as put:
+        # Files over 1 MB come back with empty content but still carry the sha
+        get.return_value = response(200, {"content": "", "sha": "big"})
+        put.return_value = response(200, {})
+        github_sync.replace_file_on_github(*HISTORY_ARGS, text, "Store data")
+    assert get.call_args.kwargs["headers"]["Accept"] == (
+        "application/vnd.github.object+json"
+    )
+    body = put.call_args.kwargs["json"]
+    assert body["sha"] == "big"
+    assert body["message"] == "Store data"
+    assert committed_text(put) == text
+
+
+def test_replace_creates_the_file_when_it_does_not_exist():
+    with mock.patch.object(github_sync.requests, "get") as get, mock.patch.object(
+        github_sync.requests, "put"
+    ) as put:
+        get.return_value = response(404, {"message": "Not Found"})
+        put.return_value = response(201, {})
+        github_sync.replace_file_on_github(*HISTORY_ARGS, "date\n", "Store data")
+    assert "sha" not in put.call_args.kwargs["json"]
+
+
+def test_replace_retries_with_the_new_sha_after_a_conflict():
+    with mock.patch.object(github_sync.requests, "get") as get, mock.patch.object(
+        github_sync.requests, "put"
+    ) as put:
+        get.side_effect = [response(200, {"sha": "old"}), response(200, {"sha": "new"})]
+        put.side_effect = [response(409, {"message": "conflict"}), response(200, {})]
+        github_sync.replace_file_on_github(*HISTORY_ARGS, "date\n", "Store data")
+    assert put.call_args.kwargs["json"]["sha"] == "new"
+
+
+def test_replace_failure_reports_the_reason_from_github():
+    with mock.patch.object(github_sync.requests, "get") as get, mock.patch.object(
+        github_sync.requests, "put"
+    ) as put:
+        get.return_value = response(200, {"sha": "sha1"})
+        put.return_value = response(422, {"message": "Invalid request"})
+        with pytest.raises(ValueError, match="HTTP 422. Invalid request"):
+            github_sync.replace_file_on_github(*HISTORY_ARGS, "date\n", "Store data")

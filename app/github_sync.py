@@ -1,4 +1,4 @@
-"""Commit ticker mappings to GitHub, as Streamlit Cloud's disk is temporary."""
+"""Commit app data to GitHub, as Streamlit Cloud's disk is temporary."""
 import base64
 import csv
 import io
@@ -72,6 +72,35 @@ def save_mappings_to_github(token, repo, branch, path, new_mappings):
             "branch": branch,
         }
         resp = requests.put(url, headers=headers, json=payload, timeout=30)
+        if resp.status_code == 409 and attempt + 1 < MAX_COMMIT_ATTEMPTS:
+            continue
+        _raise_for_github_error(resp)
+        return
+
+
+def replace_file_on_github(token, repo, branch, path, text, message):
+    """Commit text as the whole content of a file on GitHub, creating it if missing.
+
+    Earlier versions of the file stay in the repository's history.
+    """
+    url = f"{GITHUB_API_URL}/repos/{repo}/contents/{path}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+    }
+    # The object media type still returns the sha for files over 1 MB
+    read_headers = {**headers, "Accept": "application/vnd.github.object+json"}
+    content = base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+    for attempt in range(MAX_COMMIT_ATTEMPTS):
+        resp = requests.get(
+            url, headers=read_headers, params={"ref": branch}, timeout=30
+        )
+        payload = {"message": message, "content": content, "branch": branch}
+        if resp.status_code != 404:
+            _raise_for_github_error(resp)
+            payload["sha"] = resp.json()["sha"]
+        resp = requests.put(url, headers=headers, json=payload, timeout=60)
         if resp.status_code == 409 and attempt + 1 < MAX_COMMIT_ATTEMPTS:
             continue
         _raise_for_github_error(resp)
